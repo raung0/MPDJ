@@ -5,6 +5,7 @@
 
 #include "Config.hxx"
 #include "Editor.hxx"
+#include "SongAnalysis.hxx"
 #include "archive/Features.h" // for ENABLE_ARCHIVE
 
 #include <atomic>
@@ -39,11 +40,13 @@ class UpdateWalk final {
 	Storage &storage;
 
 	DatabaseEditor editor;
+	SongAnalysisQueue analysis;
 
 public:
 	UpdateWalk(const UpdateConfig &_config,
 		   EventLoop &_loop, DatabaseListener &_listener,
 		   Storage &_storage) noexcept;
+	~UpdateWalk() noexcept;
 
 	/**
 	 * Cancel the current update and quit the Walk() method as
@@ -51,6 +54,7 @@ public:
 	 */
 	void Cancel() noexcept {
 		cancel = true;
+		analysis.Stop();
 	}
 
 	/**

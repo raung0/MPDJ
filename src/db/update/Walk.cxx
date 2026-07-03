@@ -26,8 +26,10 @@
 
 #include <cassert>
 #include <cerrno>
+#include <algorithm>
 #include <exception>
 #include <memory>
+#include <thread>
 
 #include <string.h>
 #include <stdlib.h>
@@ -37,8 +39,16 @@ UpdateWalk::UpdateWalk(const UpdateConfig &_config,
 		       Storage &_storage) noexcept
 	:config(_config), cancel(false),
 	 storage(_storage),
-	 editor(_loop, _listener)
+	 editor(_loop, _listener),
+	 analysis(std::max(2u, std::thread::hardware_concurrency()))
 {
+	SetSongAnalysisQueue(&analysis);
+}
+
+UpdateWalk::~UpdateWalk() noexcept
+{
+	analysis.Stop();
+	SetSongAnalysisQueue(nullptr);
 }
 
 static void
@@ -526,6 +536,9 @@ UpdateWalk::Walk(Directory &root, const char *path, bool discard) noexcept
 		root.ClearInPlaylist();
 		PurgeDanglingFromPlaylists(root);
 	}
+
+	analysis.WaitIdle();
+	modified |= ApplySongAnalysisResults(root, analysis.CollectResults());
 
 	return modified;
 }

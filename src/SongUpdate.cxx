@@ -88,17 +88,34 @@ Song::UpdateFile(Storage &storage, const StorageFileInfo &info)
 		return false;
 	}
 
+	const auto old_mtime = mtime;
 	mtime = info.mtime;
 	audio_format = new_audio_format;
 	const auto bpm_override = tag_builder.GetBpm();
 	tag = tag_builder.Commit();
-	if (path_fs.IsNull())
-		AnalyzeUri(relative_uri, tag, bpm_override, analysis);
-	else
-		AnalyzeSong(path_fs, tag, bpm_override, analysis);
-	bpm = analysis.bpm;
-	key = std::move(analysis.key);
-	beats = std::move(analysis.beats);
+	const bool already_analyzed = bpm.has_value() && !key.empty() && !beats.empty() && old_mtime == info.mtime;
+	if (already_analyzed) {
+		/* keep existing analysis */
+	} else if (auto *analysis_queue = GetSongAnalysisQueue(); analysis_queue != nullptr) {
+		const bool queued = path_fs.IsNull()
+			? analysis_queue->Submit(std::string(relative_uri), tag, bpm_override,
+						 mtime, start_time, end_time)
+			: analysis_queue->Submit(path_fs, std::string(relative_uri), tag,
+						 bpm_override, mtime, start_time, end_time);
+		if (queued) {
+			bpm.reset();
+			key.clear();
+			beats.clear();
+		}
+	} else {
+		if (path_fs.IsNull())
+			AnalyzeUri(relative_uri, tag, bpm_override, analysis);
+		else
+			AnalyzeSong(path_fs, tag, bpm_override, analysis);
+		bpm = analysis.bpm;
+		key = std::move(analysis.key);
+		beats = std::move(analysis.beats);
+	}
 	return true;
 }
 
@@ -170,14 +187,19 @@ DetachedSong::LoadFile(Path path)
 		return false;
 	}
 
+	const auto old_mtime = mtime;
 	mtime = fi.GetModificationTime();
 	audio_format = new_audio_format;
 	const auto bpm_override = tag_builder.GetBpm();
 	tag = tag_builder.Commit();
-	AnalyzeSong(path, tag, bpm_override, analysis);
-	bpm = analysis.bpm;
-	key = std::move(analysis.key);
-	beats = std::move(analysis.beats);
+	if (bpm.has_value() && !key.empty() && !beats.empty() && old_mtime == mtime) {
+		/* keep existing analysis */
+	} else {
+		AnalyzeSong(path, tag, bpm_override, analysis);
+		bpm = analysis.bpm;
+		key = std::move(analysis.key);
+		beats = std::move(analysis.beats);
+	}
 	return true;
 }
 
@@ -203,14 +225,19 @@ DetachedSong::Update()
 			return false;
 		}
 
+		const auto old_mtime = mtime;
 		mtime = std::chrono::system_clock::time_point::min();
 		audio_format = new_audio_format;
 		const auto bpm_override = tag_builder.GetBpm();
 		tag = tag_builder.Commit();
-		AnalyzeUri(uri, tag, bpm_override, analysis);
-		bpm = analysis.bpm;
-		key = std::move(analysis.key);
-		beats = std::move(analysis.beats);
+		if (bpm.has_value() && !key.empty() && !beats.empty() && old_mtime == mtime) {
+			/* keep existing analysis */
+		} else {
+			AnalyzeUri(uri, tag, bpm_override, analysis);
+			bpm = analysis.bpm;
+			key = std::move(analysis.key);
+			beats = std::move(analysis.beats);
+		}
 		return true;
 	} else
 		// TODO: implement

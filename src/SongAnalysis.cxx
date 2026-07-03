@@ -4,6 +4,9 @@
 #include "SongAnalysis.hxx"
 
 #include "archive/ArchiveFile.hxx"
+#include "db/DatabaseLock.hxx"
+#include "db/plugins/simple/Directory.hxx"
+#include "db/plugins/simple/Song.hxx"
 #include "decoder/Client.hxx"
 #include "decoder/DecoderList.hxx"
 #include "decoder/DecoderPlugin.hxx"
@@ -18,17 +21,162 @@
 #include "util/StringCompare.hxx"
 #include "util/UriExtract.hxx"
 #include "thread/Mutex.hxx"
+#include "thread/Cond.hxx"
 
 #include <aubio/aubio.h>
 #include <keyfinder/keyfinder.h>
 
 #include <algorithm>
+#include <deque>
 #include <cstring>
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <thread>
+#include <utility>
 
 using std::string_view_literals::operator""sv;
+
+static SongAnalysisQueue *current_song_analysis_queue = nullptr;
+
+void
+SetSongAnalysisQueue(SongAnalysisQueue *queue) noexcept
+{
+	current_song_analysis_queue = queue;
+}
+
+SongAnalysisQueue *
+GetSongAnalysisQueue() noexcept
+{
+	return current_song_analysis_queue;
+}
+
+SongAnalysisQueue::SongAnalysisQueue(unsigned worker_count) noexcept
+{
+	if (worker_count == 0)
+		worker_count = 2;
+
+	workers.reserve(worker_count);
+	for (unsigned i = 0; i < worker_count; ++i)
+		workers.emplace_back(std::make_unique<Thread>(BIND_THIS_METHOD(Worker)));
+	for (auto &worker : workers)
+		worker->Start();
+}
+
+SongAnalysisQueue::~SongAnalysisQueue() noexcept
+{
+	Stop();
+
+	for (auto &worker : workers)
+		worker->Join();
+}
+
+bool
+SongAnalysisQueue::Submit(AllocatedPath path_fs, std::string uri, const Tag &tag,
+			  const std::optional<double> &bpm_override,
+			  std::chrono::system_clock::time_point mtime,
+			  SongTime start_time, SongTime end_time) noexcept
+{
+	const std::lock_guard lock{mutex};
+	if (stop)
+		return false;
+	queue.emplace_back(Task{true, std::move(path_fs), std::move(uri), tag,
+				 bpm_override, mtime, start_time, end_time});
+	++pending;
+	cond.notify_one();
+	return true;
+}
+
+bool
+SongAnalysisQueue::Submit(std::string uri, const Tag &tag,
+			  const std::optional<double> &bpm_override,
+			  std::chrono::system_clock::time_point mtime,
+			  SongTime start_time, SongTime end_time) noexcept
+{
+	const std::lock_guard lock{mutex};
+	if (stop)
+		return false;
+	queue.emplace_back(Task{false, AllocatedPath{nullptr}, std::move(uri), tag,
+				 bpm_override, mtime, start_time, end_time});
+	++pending;
+	cond.notify_one();
+	return true;
+}
+
+void
+SongAnalysisQueue::WaitIdle() noexcept
+{
+	std::unique_lock lock{mutex};
+	idle_cond.wait(lock, [this]{ return pending == 0 || stop; });
+}
+
+void
+SongAnalysisQueue::Stop() noexcept
+{
+	const std::lock_guard lock{mutex};
+	stop = true;
+	pending -= queue.size();
+	queue.clear();
+	cond.notify_all();
+	idle_cond.notify_all();
+}
+
+std::vector<SongAnalysisResult>
+SongAnalysisQueue::CollectResults() noexcept
+{
+	const std::lock_guard lock{mutex};
+	std::vector<SongAnalysisResult> out;
+	out.reserve(results.size());
+	while (!results.empty()) {
+		out.push_back(std::move(results.front()));
+		results.pop_front();
+	}
+	return out;
+}
+
+void
+SongAnalysisQueue::Worker() noexcept
+{
+	for (;;) {
+		Task task{false, AllocatedPath{nullptr}, {}, {}, {}, {}, {}, {}};
+		bool ok = false;
+		SongAnalysis analysis;
+		{
+			std::unique_lock lock{mutex};
+			cond.wait(lock, [this]{ return stop || !queue.empty(); });
+			if (stop && queue.empty())
+				return;
+
+			task = std::move(queue.front());
+			queue.pop_front();
+		}
+
+		try {
+			ok = task.is_path
+				? AnalyzeSong(task.path_fs, task.tag, task.bpm_override, analysis)
+				: AnalyzeUri(task.uri, task.tag, task.bpm_override, analysis);
+		} catch (...) {
+		}
+
+		{
+			const std::lock_guard lock{mutex};
+			if (ok) {
+				try {
+					results.push_back(SongAnalysisResult{
+						std::move(task.uri), task.mtime,
+						task.start_time, task.end_time,
+						std::move(analysis),
+					});
+				} catch (...) {
+					ok = false;
+				}
+			}
+
+			if (--pending == 0)
+				idle_cond.notify_all();
+		}
+	}
+}
 
 namespace {
 
@@ -230,6 +378,9 @@ AnalyzeSamples(const std::vector<float> &samples,
 	}
 
 	for (std::size_t offset = 0; offset < samples.size(); offset += hop_s) {
+		if (auto *queue = GetSongAnalysisQueue(); queue != nullptr && queue->IsStopped())
+			break;
+
 		const std::size_t n = std::min<std::size_t>(hop_s, samples.size() - offset);
 		fvec_zeros(input);
 		for (std::size_t i = 0; i < n; ++i)
@@ -246,6 +397,13 @@ AnalyzeSamples(const std::vector<float> &samples,
 		const double bpm = double(aubio_tempo_get_bpm(tempo));
 		if (bpm > 0.0)
 			analysis.bpm = bpm;
+	}
+
+	if (auto *queue = GetSongAnalysisQueue(); queue != nullptr && queue->IsStopped()) {
+		del_aubio_tempo(tempo);
+		del_fvec(input);
+		del_fvec(beat);
+		return;
 	}
 
 	KeyFinder::AudioData audio;
@@ -432,4 +590,34 @@ AnalyzeUri(std::string_view uri, const Tag &tag,
 	} catch (...) {
 		return false;
 	}
+}
+
+static bool
+ApplySongAnalysisResult(Directory &root, const SongAnalysisResult &result) noexcept
+{
+	const auto lr = root.LookupDirectory(result.uri);
+	Song *song = lr.directory->FindSong(lr.rest);
+	if (song == nullptr)
+		return false;
+
+	if (song->mtime != result.mtime ||
+	    song->start_time != result.start_time ||
+	    song->end_time != result.end_time)
+		return false;
+
+	song->bpm = result.analysis.bpm;
+	song->key = result.analysis.key;
+	song->beats = result.analysis.beats;
+	return true;
+}
+
+bool
+ApplySongAnalysisResults(Directory &root,
+			 const std::vector<SongAnalysisResult> &results) noexcept
+{
+	bool modified = false;
+	const ScopeDatabaseLock protect;
+	for (const auto &result : results)
+		modified |= ApplySongAnalysisResult(root, result);
+	return modified;
 }
