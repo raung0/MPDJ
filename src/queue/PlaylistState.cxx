@@ -34,6 +34,7 @@
 #define PLAYLIST_STATE_FILE_CURRENT		"current: "
 #define PLAYLIST_STATE_FILE_TIME		"time: "
 #define PLAYLIST_STATE_FILE_CROSSFADE		"crossfade: "
+#define PLAYLIST_STATE_FILE_AUTOMIX		"automix: "
 #define PLAYLIST_STATE_FILE_MIXRAMPDB		"mixrampdb: "
 #define PLAYLIST_STATE_FILE_MIXRAMPDELAY	"mixrampdelay: "
 #define PLAYLIST_STATE_FILE_LOADED_PLAYLIST	"lastloadedplaylist: "
@@ -82,6 +83,8 @@ playlist_state_save(BufferedOutputStream &os, const struct playlist &playlist,
 	       ConsumeToString(playlist.queue.consume));
 	os.Fmt(PLAYLIST_STATE_FILE_CROSSFADE "{}\n",
 	       pc.GetCrossFade().count());
+	os.Fmt(PLAYLIST_STATE_FILE_AUTOMIX "{}\n",
+	       (unsigned)pc.GetAutomix());
 	os.Fmt(PLAYLIST_STATE_FILE_MIXRAMPDB "{}\n",
 	       pc.GetMixRampDb());
 	os.Fmt(PLAYLIST_STATE_FILE_MIXRAMPDELAY "{}\n",
@@ -152,6 +155,8 @@ playlist_state_restore(const StateFileConfig &config,
 			playlist.SetConsume(ConsumeFromString(p));
 		} else if ((p = StringAfterPrefix(line, PLAYLIST_STATE_FILE_CROSSFADE))) {
 			pc.SetCrossFade(FloatDuration(atoi(p)));
+		} else if ((p = StringAfterPrefix(line, PLAYLIST_STATE_FILE_AUTOMIX))) {
+			pc.SetAutomix(StringIsEqual(p, "1"));
 		} else if ((p = StringAfterPrefix(line, PLAYLIST_STATE_FILE_MIXRAMPDB))) {
 			pc.SetMixRampDb(ParseFloat(p));
 		} else if ((p = StringAfterPrefix(line, PLAYLIST_STATE_FILE_MIXRAMPDELAY))) {
@@ -230,6 +235,7 @@ playlist_state_get_hash(const playlist &playlist,
 		(unsigned(player_status.state) << 24) ^
 		/* note that this takes 2 bits */
 		((int)playlist.queue.single << 25) ^
+		(unsigned(pc.GetAutomix()) << 26) ^
 		(playlist.queue.random << 27) ^
 		(playlist.queue.repeat << 28) ^
 		/* note that this takes 2 bits */

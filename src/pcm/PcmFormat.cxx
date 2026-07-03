@@ -10,6 +10,8 @@
 #include "util/SpanCast.hxx"
 #include "util/TransformN.hxx"
 
+#include <algorithm>
+
 #include "Dither.cxx" // including the .cxx file to get inlined templates
 
 /**
@@ -346,6 +348,21 @@ pcm_allocate_32_to_float(PcmBuffer &buffer, std::span<const int32_t> src)
 	return AllocateConvert(buffer, Convert32ToFloat(), src);
 }
 
+template<SampleFormat F, IntegerSampleTraits Traits=SampleTraits<F>>
+static std::span<const typename Traits::value_type>
+pcm_allocate_from_float(PcmBuffer &buffer, std::span<const float> src)
+{
+	return AllocateFromFloat<F, Traits>(buffer, src);
+}
+
+static std::span<const std::byte>
+pcm_allocate_float_to_float(PcmBuffer &buffer, std::span<const float> src)
+{
+	auto dest = buffer.GetT<float>(src.size());
+	std::copy(src.begin(), src.end(), dest);
+	return {reinterpret_cast<const std::byte *>(dest), src.size_bytes()};
+}
+
 std::span<const float>
 pcm_convert_to_float(PcmBuffer &buffer,
 		     SampleFormat src_format, std::span<const std::byte> src) noexcept
@@ -373,6 +390,50 @@ pcm_convert_to_float(PcmBuffer &buffer,
 
 	case SampleFormat::FLOAT:
 		return FromBytesStrict<const float>(src);
+	}
+
+	return {};
+}
+
+std::span<const std::byte>
+pcm_convert_from_float(PcmBuffer &buffer, SampleFormat dst_format,
+		       std::span<const float> src) noexcept
+{
+	switch (dst_format) {
+	case SampleFormat::UNDEFINED:
+	case SampleFormat::DSD:
+		break;
+
+	case SampleFormat::S8:
+		{
+			auto dest = pcm_allocate_from_float<SampleFormat::S8>(buffer, src);
+			return {reinterpret_cast<const std::byte *>(dest.data()),
+				dest.size_bytes()};
+		}
+
+	case SampleFormat::S16:
+		{
+			auto dest = pcm_allocate_from_float<SampleFormat::S16>(buffer, src);
+			return {reinterpret_cast<const std::byte *>(dest.data()),
+				dest.size_bytes()};
+		}
+
+	case SampleFormat::S24_P32:
+		{
+			auto dest = pcm_allocate_from_float<SampleFormat::S24_P32>(buffer, src);
+			return {reinterpret_cast<const std::byte *>(dest.data()),
+				dest.size_bytes()};
+		}
+
+	case SampleFormat::S32:
+		{
+			auto dest = pcm_allocate_from_float<SampleFormat::S32>(buffer, src);
+			return {reinterpret_cast<const std::byte *>(dest.data()),
+				dest.size_bytes()};
+		}
+
+	case SampleFormat::FLOAT:
+		return pcm_allocate_float_to_float(buffer, src);
 	}
 
 	return {};

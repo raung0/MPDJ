@@ -75,6 +75,7 @@ static constexpr struct command commands[] = {
 	{ "addid", PERMISSION_ADD, 1, 2, handle_addid },
 	{ "addtagid", PERMISSION_ADD, 3, 3, handle_addtagid },
 	{ "albumart", PERMISSION_READ, 2, 2, handle_album_art },
+	{ "automix", PERMISSION_PLAYER, 1, 1, handle_automix },
 	{ "binarylimit", PERMISSION_NONE, 1, 1, handle_binary_limit },
 	{ "channels", PERMISSION_READ, 0, 0, handle_channels },
 	{ "clear", PERMISSION_PLAYER, 0, 0, handle_clear },

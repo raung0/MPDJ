@@ -58,6 +58,17 @@ struct MusicChunkInfo {
 	SignedSongTime time;
 
 	/**
+	 * If true, the other chunk in a cross-fade should be tempo-matched
+	 * before mixing.
+	 */
+	bool automix = false;
+
+	/**
+	 * Tempo ratio used for automix.  1.0 means no change.
+	 */
+	float automix_time_ratio = 1.0f;
+
+	/**
 	 * Replay gain information associated with this chunk.
 	 * Only valid if the serial is not 0.
 	 */

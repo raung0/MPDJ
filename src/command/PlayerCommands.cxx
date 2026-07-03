@@ -24,6 +24,8 @@
 
 #include <fmt/format.h>
 
+#include <string.h>
+
 #define COMMAND_STATUS_STATE            "state"
 #define COMMAND_STATUS_REPEAT           "repeat"
 #define COMMAND_STATUS_SINGLE           "single"
@@ -39,6 +41,7 @@
 #define COMMAND_STATUS_BITRATE          "bitrate"
 #define COMMAND_STATUS_ERROR            "error"
 #define COMMAND_STATUS_CROSSFADE	"xfade"
+#define COMMAND_STATUS_AUTOMIX	"automix"
 #define COMMAND_STATUS_MIXRAMPDB	"mixrampdb"
 #define COMMAND_STATUS_MIXRAMPDELAY	"mixrampdelay"
 #define COMMAND_STATUS_AUDIO		"audio"
@@ -152,6 +155,9 @@ handle_status(Client &client, [[maybe_unused]] Request args, Response &r)
 	if (pc.GetCrossFade() > FloatDuration::zero())
 		r.Fmt(COMMAND_STATUS_CROSSFADE ": {}\n",
 		      std::lround(pc.GetCrossFade().count()));
+
+	if (pc.GetAutomix())
+		r.Fmt(COMMAND_STATUS_AUTOMIX ": {}\n", 1);
 
 	if (pc.GetMixRampDelay() > FloatDuration::zero())
 		r.Fmt(COMMAND_STATUS_MIXRAMPDELAY ": {}\n",
@@ -315,6 +321,22 @@ handle_crossfade(Client &client, Request args, [[maybe_unused]] Response &r)
 {
 	FloatDuration duration{args.ParseUnsigned(0)};
 	client.GetPlayerControl().SetCrossFade(duration);
+	return CommandResult::OK;
+}
+
+CommandResult
+handle_automix(Client &client, Request args, [[maybe_unused]] Response &r)
+{
+	const char *arg = args.front();
+
+	if (strcmp(arg, "status") == 0) {
+		r.Fmt(COMMAND_STATUS_AUTOMIX ": {}\n",
+		      (unsigned)client.GetPlayerControl().GetAutomix());
+	} else {
+		bool automix = args.ParseBool(0);
+		client.GetPlayerControl().SetAutomix(automix);
+	}
+
 	return CommandResult::OK;
 }
 

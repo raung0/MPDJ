@@ -208,6 +208,7 @@ class PlayerControl final : public AudioOutputClient {
 	SongTime seek_time;
 
 	CrossFadeSettings cross_fade;
+	bool automix = false;
 
 	FloatDuration total_play_time = FloatDuration::zero();
 
@@ -275,9 +276,14 @@ public:
 	 */
 	void LockSetBorderPause(bool border_pause) noexcept;
 	void SetCrossFade(FloatDuration duration) noexcept;
+	void SetAutomix(bool _automix) noexcept;
 
 	auto GetCrossFade() const noexcept {
 		return cross_fade.duration;
+	}
+
+	bool GetAutomix() const noexcept {
+		return automix;
 	}
 
 	void SetMixRampDb(float mixramp_db) noexcept;

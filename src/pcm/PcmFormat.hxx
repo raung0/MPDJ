@@ -62,4 +62,12 @@ std::span<const float>
 pcm_convert_to_float(PcmBuffer &buffer,
 		     SampleFormat src_format, std::span<const std::byte> src) noexcept;
 
+/**
+ * Converts 32 bit floating point PCM samples to the specified sample format.
+ */
+[[gnu::pure]]
+std::span<const std::byte>
+pcm_convert_from_float(PcmBuffer &buffer, SampleFormat dst_format,
+		       std::span<const float> src) noexcept;
+
 #endif

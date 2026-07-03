@@ -5,6 +5,7 @@
 #include "db/Interface.hxx"
 #include "song/LightSong.hxx"
 #include "song/DetachedSong.hxx"
+#include "time/ChronoUtil.hxx"
 
 static bool
 UpdatePlaylistSong(const Database &db, DetachedSong &song)
@@ -26,7 +27,16 @@ UpdatePlaylistSong(const Database &db, DetachedSong &song)
 
 	assert(original != nullptr);
 
-	if (original->mtime == song.GetLastModified()) {
+	const auto original_added = IsNegative(original->added)
+		? original->mtime
+		: original->added;
+
+	if (original->mtime == song.GetLastModified() &&
+	    original_added == song.GetAdded() &&
+	    original->tag == song.GetTag() &&
+	    original->bpm == song.GetBpm() &&
+	    original->key == song.GetKey() &&
+	    original->beats == song.GetBeats()) {
 		/* not modified */
 		db.ReturnSong(original);
 		return false;
@@ -35,6 +45,9 @@ UpdatePlaylistSong(const Database &db, DetachedSong &song)
 	song.SetLastModified(original->mtime);
 	song.SetAdded(original->added);
 	song.SetTag(original->tag);
+	song.SetBpm(original->bpm);
+	song.SetKey(original->key);
+	song.SetBeats(original->beats);
 
 	db.ReturnSong(original);
 	return true;

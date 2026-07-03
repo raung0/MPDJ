@@ -62,6 +62,9 @@ CommandResult
 handle_crossfade(Client &client, Request request, Response &response);
 
 CommandResult
+handle_automix(Client &client, Request request, Response &response);
+
+CommandResult
 handle_mixrampdb(Client &client, Request request, Response &response);
 
 CommandResult

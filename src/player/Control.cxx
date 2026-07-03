@@ -291,6 +291,14 @@ PlayerControl::SetCrossFade(FloatDuration duration) noexcept
 }
 
 void
+PlayerControl::SetAutomix(bool _automix) noexcept
+{
+	automix = _automix;
+
+	listener.OnPlayerOptionsChanged();
+}
+
+void
 PlayerControl::SetMixRampDb(float _mixramp_db) noexcept
 {
 	cross_fade.mixramp_db = _mixramp_db;
