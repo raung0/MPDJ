@@ -10,6 +10,9 @@ DetachedSong::DetachedSong(const LightSong &other) noexcept
 	:uri(other.GetURI()),
 	 real_uri(other.real_uri != nullptr ? other.real_uri : ""),
 	 tag(other.tag),
+	 bpm(other.bpm),
+	 key(other.key),
+	 beats(other.beats),
 	 mtime(other.mtime),
 	 added(other.added),
 	 start_time(other.start_time),
@@ -21,6 +24,9 @@ DetachedSong::operator LightSong() const noexcept
 	LightSong result(uri.c_str(), tag);
 	result.directory = nullptr;
 	result.real_uri = real_uri.empty() ? nullptr : real_uri.c_str();
+	result.bpm = bpm;
+	result.key = key;
+	result.beats = beats;
 	result.mtime = mtime;
 	result.added = added;
 	result.start_time = start_time;

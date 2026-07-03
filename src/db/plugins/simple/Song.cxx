@@ -18,6 +18,9 @@ Song::Song(DetachedSong &&other, Directory &_parent) noexcept
 	:parent(_parent),
 	 filename(other.GetURI()),
 	 tag(std::move(other.WritableTag())),
+	 bpm(other.GetBpm()),
+	 key(other.GetKey()),
+	 beats(other.GetBeats()),
 	 mtime(other.GetLastModified()),
 	 added(other.GetAdded()),
 	 start_time(other.GetStartTime()),
@@ -111,6 +114,15 @@ Song::Export() const noexcept
 	ExportedSong dest = merged_tag.IsDefined()
 		? ExportedSong(filename.c_str(), std::move(merged_tag))
 		: ExportedSong(filename.c_str(), tag);
+	dest.bpm = bpm;
+	dest.key = key;
+	dest.beats = beats;
+	if (!dest.bpm && target_song != nullptr)
+		dest.bpm = target_song->bpm;
+	if (dest.key.empty() && target_song != nullptr)
+		dest.key = target_song->key;
+	if (dest.beats.empty() && target_song != nullptr)
+		dest.beats = target_song->beats;
 	if (!parent.IsRoot())
 		dest.directory = parent.GetPath();
 	if (!target.empty())

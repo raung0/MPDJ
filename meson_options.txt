@@ -194,11 +194,14 @@ option('solaris_output', type: 'feature', description: 'Solaris /dev/audio suppo
 
 option('dbus', type: 'feature', description: 'D-Bus support')
 option('expat', type: 'feature', description: 'Expat XML support')
+option('aubio', type: 'feature', description: 'aubio audio analysis library')
 option('icu', type: 'feature', description: 'Use libicu for Unicode')
 option('iconv', type: 'feature', description: 'Use iconv() for character set conversion')
+option('libkeyfinder', type: 'feature', description: 'libkeyfinder key detection library')
 option('nlohmann_json', type: 'feature', description: 'nlohmann_json for JSON support')
 option('pcre', type: 'feature', description: 'Enable regular expression support (using libpcre)')
 option('sqlite', type: 'feature', description: 'SQLite database support (for stickers)')
+option('rubberband', type: 'feature', description: 'Rubber Band time-stretching library')
 option('zlib', type: 'feature', description: 'zlib support (for database compression)')
 
 option('zeroconf', type: 'combo',

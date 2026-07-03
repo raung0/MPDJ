@@ -9,6 +9,8 @@
 
 #include <string>
 #include <chrono>
+#include <optional>
+#include <vector>
 
 struct Tag;
 
@@ -44,6 +46,21 @@ struct LightSong {
 	 * Metadata.
 	 */
 	const Tag &tag;
+
+	/**
+	 * Estimated tempo in beats per minute.
+	 */
+	std::optional<double> bpm;
+
+	/**
+	 * Estimated musical key.
+	 */
+	std::string key;
+
+	/**
+	 * Beat timestamps in seconds.
+	 */
+	std::vector<double> beats;
 
 	/**
 	 * The time stamp of the last file modification.  A negative
@@ -91,6 +108,7 @@ struct LightSong {
 		:directory(src.directory), uri(src.uri),
 		 real_uri(src.real_uri),
 		 tag(_tag),
+		 bpm(src.bpm), key(src.key), beats(src.beats),
 		 mtime(src.mtime),
 		 start_time(src.start_time), end_time(src.end_time),
 		 audio_format(src.audio_format) {}

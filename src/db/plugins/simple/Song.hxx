@@ -11,6 +11,8 @@
 #include "util/IntrusiveList.hxx"
 
 #include <string>
+#include <optional>
+#include <vector>
 
 struct Directory;
 struct StorageFileInfo;
@@ -48,6 +50,9 @@ struct Song : IntrusiveListHook<> {
 	std::string target;
 
 	Tag tag;
+	std::optional<double> bpm;
+	std::string key;
+	std::vector<double> beats;
 
 	/**
 	 * The time stamp of the last file modification.  A negative

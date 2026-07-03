@@ -6,11 +6,14 @@
 #include "Pool.hxx"
 #include "FixString.hxx"
 #include "Tag.hxx"
+#include "util/CNumberParser.hxx"
+#include "util/StringCompare.hxx"
 #include "util/AllocatedArray.hxx"
 
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <string>
 
 #include <stdlib.h>
 
@@ -47,6 +50,8 @@ TagBuilder::operator=(const TagBuilder &other) noexcept
 	/* copy all attributes */
 	duration = other.duration;
 	has_playlist = other.has_playlist;
+	bpm_comment = other.bpm_comment;
+	bpm_tag = other.bpm_tag;
 
 	RemoveAll();
 
@@ -69,6 +74,8 @@ TagBuilder::operator=(TagBuilder &&other) noexcept
 
 	duration = other.duration;
 	has_playlist = other.has_playlist;
+	bpm_comment = other.bpm_comment;
+	bpm_tag = other.bpm_tag;
 
 	/* swap the two TagItem lists so we don't need to touch the
 	   tag pool just yet */
@@ -103,6 +110,8 @@ TagBuilder::Clear() noexcept
 {
 	duration = SignedSongTime::Negative();
 	has_playlist = false;
+	bpm_comment.reset();
+	bpm_tag.reset();
 	RemoveAll();
 }
 
@@ -127,6 +136,23 @@ TagBuilder::Commit(Tag &tag) noexcept
 	/* now ensure that this object is fresh (will not delete any
 	   items because we've already moved them out) */
 	Clear();
+}
+
+void
+TagBuilder::AddPair(std::string_view name, std::string_view value) noexcept
+{
+	const std::string value_s(value);
+	char *end = nullptr;
+
+	if (StringIsEqualIgnoreCase(name, "BPM_FLOAT")) {
+		const double bpm = ParseDouble(value_s.c_str(), &end);
+		if (end == value_s.c_str() + value_s.size())
+			bpm_comment = bpm;
+	} else if (StringIsEqualIgnoreCase(name, "BPM")) {
+		const double bpm = ParseDouble(value_s.c_str(), &end);
+		if (end == value_s.c_str() + value_s.size())
+			bpm_tag = bpm;
+	}
 }
 
 Tag

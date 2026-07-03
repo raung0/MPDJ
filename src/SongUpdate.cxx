@@ -15,6 +15,7 @@
 #include "fs/FileInfo.hxx"
 #include "thread/Mutex.hxx"
 #include "tag/Builder.hxx"
+#include "SongAnalysis.hxx"
 #include "TagFile.hxx"
 #include "TagStream.hxx"
 #include "util/UriExtract.hxx"
@@ -25,6 +26,7 @@
 #endif
 
 #include <cassert>
+#include <utility>
 
 #include <string.h>
 
@@ -62,12 +64,13 @@ Song::UpdateFile(Storage &storage, const StorageFileInfo &info)
 	assert(info.IsRegular());
 
 	const auto &relative_uri = GetURI();
+	const auto path_fs = storage.MapFS(relative_uri);
 
 	TagBuilder tag_builder;
 	auto new_audio_format = AudioFormat::Undefined();
+	SongAnalysis analysis;
 
 	try {
-		const auto path_fs = storage.MapFS(relative_uri);
 		if (path_fs.IsNull()) {
 			Mutex mutex;
 			const auto is = storage.OpenFile(relative_uri, mutex);
@@ -87,7 +90,15 @@ Song::UpdateFile(Storage &storage, const StorageFileInfo &info)
 
 	mtime = info.mtime;
 	audio_format = new_audio_format;
-	tag_builder.Commit(tag);
+	const auto bpm_override = tag_builder.GetBpm();
+	tag = tag_builder.Commit();
+	if (path_fs.IsNull())
+		AnalyzeUri(relative_uri, tag, bpm_override, analysis);
+	else
+		AnalyzeSong(path_fs, tag, bpm_override, analysis);
+	bpm = analysis.bpm;
+	key = std::move(analysis.key);
+	beats = std::move(analysis.beats);
 	return true;
 }
 
@@ -123,10 +134,16 @@ Song::UpdateFileInArchive(ArchiveFile &archive) noexcept
 	}
 
 	TagBuilder tag_builder;
+	SongAnalysis analysis;
 	if (!tag_archive_scan(archive, path_utf8.c_str(), tag_builder))
 		return false;
 
-	tag_builder.Commit(tag);
+	const auto bpm_override = tag_builder.GetBpm();
+	tag = tag_builder.Commit();
+	AnalyzeArchive(archive, path_utf8, tag, bpm_override, analysis);
+	bpm = analysis.bpm;
+	key = std::move(analysis.key);
+	beats = std::move(analysis.beats);
 	return true;
 }
 
@@ -143,6 +160,7 @@ DetachedSong::LoadFile(Path path)
 
 	TagBuilder tag_builder;
 	auto new_audio_format = AudioFormat::Undefined();
+	SongAnalysis analysis;
 
 	try {
 		if (!ScanFileTagsWithGeneric(path, tag_builder, &new_audio_format))
@@ -154,7 +172,12 @@ DetachedSong::LoadFile(Path path)
 
 	mtime = fi.GetModificationTime();
 	audio_format = new_audio_format;
-	tag_builder.Commit(tag);
+	const auto bpm_override = tag_builder.GetBpm();
+	tag = tag_builder.Commit();
+	AnalyzeSong(path, tag, bpm_override, analysis);
+	bpm = analysis.bpm;
+	key = std::move(analysis.key);
+	beats = std::move(analysis.beats);
 	return true;
 }
 
@@ -169,6 +192,7 @@ DetachedSong::Update()
 	} else if (IsRemote()) {
 		TagBuilder tag_builder;
 		auto new_audio_format = AudioFormat::Undefined();
+		SongAnalysis analysis;
 
 		try {
 			if (!tag_stream_scan(uri, tag_builder,
@@ -181,7 +205,12 @@ DetachedSong::Update()
 
 		mtime = std::chrono::system_clock::time_point::min();
 		audio_format = new_audio_format;
-		tag_builder.Commit(tag);
+		const auto bpm_override = tag_builder.GetBpm();
+		tag = tag_builder.Commit();
+		AnalyzeUri(uri, tag, bpm_override, analysis);
+		bpm = analysis.bpm;
+		key = std::move(analysis.key);
+		beats = std::move(analysis.beats);
 		return true;
 	} else
 		// TODO: implement

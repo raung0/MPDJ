@@ -20,10 +20,15 @@
 #include "util/CNumberParser.hxx"
 
 #include <stdlib.h>
+#include <optional>
+#include <vector>
 
 #define SONG_MTIME "mtime"
 #define SONG_ADDED "added"
 #define SONG_END "song_end"
+#define SONG_BPM "bpm"
+#define SONG_KEY "key"
+#define SONG_BEAT "beat"
 
 static void
 range_save(BufferedOutputStream &os, unsigned start_ms, unsigned end_ms)
@@ -32,6 +37,32 @@ range_save(BufferedOutputStream &os, unsigned start_ms, unsigned end_ms)
 		os.Fmt("Range: {}-{}\n", start_ms, end_ms);
 	else if (start_ms > 0)
 		os.Fmt("Range: {}-\n", start_ms);
+}
+
+static void
+analysis_save(BufferedOutputStream &os, const DetachedSong &song)
+{
+	if (song.GetBpm())
+		os.Fmt(SONG_BPM ": {:.17g}\n", *song.GetBpm());
+
+	if (!song.GetKey().empty())
+		os.Fmt(SONG_KEY ": {}\n", song.GetKey());
+
+	for (double beat : song.GetBeats())
+		os.Fmt(SONG_BEAT ": {:.17g}\n", beat);
+}
+
+static void
+analysis_save(BufferedOutputStream &os, const Song &song)
+{
+	if (song.bpm)
+		os.Fmt(SONG_BPM ": {:.17g}\n", *song.bpm);
+
+	if (!song.key.empty())
+		os.Fmt(SONG_KEY ": {}\n", song.key);
+
+	for (double beat : song.beats)
+		os.Fmt(SONG_BEAT ": {:.17g}\n", beat);
 }
 
 void
@@ -45,6 +76,7 @@ song_save(BufferedOutputStream &os, const Song &song)
 	range_save(os, song.start_time.ToMS(), song.end_time.ToMS());
 
 	tag_save(os, song.tag);
+	analysis_save(os, song);
 
 	if (song.audio_format.IsDefined())
 		os.Fmt("Format: {}\n", song.audio_format);
@@ -70,6 +102,7 @@ song_save(BufferedOutputStream &os, const DetachedSong &song)
 	range_save(os, song.GetStartTime().ToMS(), song.GetEndTime().ToMS());
 
 	tag_save(os, song.GetTag());
+	analysis_save(os, song);
 
 	if (!IsNegative(song.GetLastModified()))
 		os.Fmt(SONG_MTIME ": {}\n",
@@ -88,6 +121,9 @@ song_load(LineReader &file, const char *uri,
 	DetachedSong song(uri);
 
 	TagBuilder tag;
+	std::optional<double> bpm;
+	std::string key;
+	std::vector<double> beats;
 
 	char *line;
 	while ((line = file.ReadLine()) != nullptr &&
@@ -116,6 +152,12 @@ song_load(LineReader &file, const char *uri,
 			}
 		} else if (StringIsEqual(line, "Playlist")) {
 			tag.SetHasPlaylist(StringIsEqual(value, "yes"));
+		} else if (StringIsEqual(line, SONG_BPM)) {
+			bpm = ParseDouble(value);
+		} else if (StringIsEqual(line, SONG_KEY)) {
+			key = value;
+		} else if (StringIsEqual(line, SONG_BEAT)) {
+			beats.push_back(ParseDouble(value));
 		} else if (StringIsEqual(line, SONG_MTIME)) {
 			song.SetLastModified(std::chrono::system_clock::from_time_t(atoi(value)));
 		} else if (StringIsEqual(line, SONG_ADDED)) {
@@ -139,5 +181,8 @@ song_load(LineReader &file, const char *uri,
 	}
 
 	song.SetTag(tag.Commit());
+	song.SetBpm(bpm);
+	song.SetKey(std::move(key));
+	song.SetBeats(std::move(beats));
 	return song;
 }

@@ -8,6 +8,7 @@
 #include "Chrono.hxx"
 
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -32,6 +33,9 @@ class TagBuilder {
 
 	/** an array of tag items */
 	std::vector<TagItem *> items;
+
+	std::optional<double> bpm_comment;
+	std::optional<double> bpm_tag;
 
 public:
 	/**
@@ -100,6 +104,11 @@ public:
 		has_playlist = _has_playlist;
 	}
 
+	[[gnu::pure]]
+	std::optional<double> GetBpm() const noexcept {
+		return bpm_comment.has_value() ? bpm_comment : bpm_tag;
+	}
+
 	void Reserve(unsigned n) noexcept {
 		items.reserve(n);
 	}
@@ -148,6 +157,8 @@ public:
 	 * Removes all tag items of the specified type.
 	 */
 	void RemoveType(TagType type) noexcept;
+
+	void AddPair(std::string_view name, std::string_view value) noexcept;
 
 private:
 	void AddItemInternal(TagType type, std::string_view value) noexcept;

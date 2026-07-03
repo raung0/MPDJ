@@ -11,6 +11,8 @@
 
 #include <chrono>
 #include <string>
+#include <optional>
+#include <vector>
 #include <utility>
 
 struct LightSong;
@@ -51,6 +53,9 @@ class DetachedSong {
 	std::string real_uri;
 
 	Tag tag;
+	std::optional<double> bpm;
+	std::string key;
+	std::vector<double> beats;
 
 	/**
 	 * The time stamp of the last file modification.  A negative
@@ -186,6 +191,30 @@ public:
 
 	const Tag &GetTag() const noexcept {
 		return tag;
+	}
+
+	const std::optional<double> &GetBpm() const noexcept {
+		return bpm;
+	}
+
+	const std::string &GetKey() const noexcept {
+		return key;
+	}
+
+	const std::vector<double> &GetBeats() const noexcept {
+		return beats;
+	}
+
+	void SetBpm(std::optional<double> _bpm) noexcept {
+		bpm = std::move(_bpm);
+	}
+
+	void SetKey(std::string _key) noexcept {
+		key = std::move(_key);
+	}
+
+	void SetBeats(std::vector<double> _beats) noexcept {
+		beats = std::move(_beats);
 	}
 
 	Tag &WritableTag() noexcept {

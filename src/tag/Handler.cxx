@@ -63,10 +63,12 @@ AddTagHandler::OnTag(TagType type, std::string_view value) noexcept
 }
 
 void
-FullTagHandler::OnPair(std::string_view name, std::string_view) noexcept
+FullTagHandler::OnPair(std::string_view name, std::string_view value) noexcept
 {
 	if (StringIsEqualIgnoreCase(name, "cuesheet"sv))
 		tag.SetHasPlaylist(true);
+	else
+		tag.AddPair(name, value);
 }
 
 void

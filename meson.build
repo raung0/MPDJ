@@ -422,6 +422,7 @@ sources = [
   'src/queue/PlaylistTag.cxx',
   'src/queue/PlaylistState.cxx',
   'src/LocateUri.cxx',
+  'src/SongAnalysis.cxx',
   'src/SongUpdate.cxx',
   'src/SongLoader.cxx',
   'src/SongPrint.cxx',
@@ -502,17 +503,20 @@ subdir('src/lib/smbclient')
 subdir('src/lib/zlib')
 
 subdir('src/lib/alsa')
+subdir('src/lib/aubio')
 subdir('src/lib/chromaprint')
 subdir('src/lib/curl')
 subdir('src/lib/expat')
 subdir('src/lib/ffmpeg')
 subdir('src/lib/gcrypt')
+subdir('src/lib/keyfinder')
 subdir('src/lib/nfs')
 subdir('src/lib/nlohmann_json')
 subdir('src/lib/oss')
 subdir('src/lib/pcre')
 subdir('src/lib/pipewire')
 subdir('src/lib/pulse')
+subdir('src/lib/rubberband')
 subdir('src/lib/sndio')
 subdir('src/lib/sqlite')
 subdir('src/lib/systemd')
@@ -651,9 +655,12 @@ mpd = build_target(
     zeroconf_dep,
     more_deps,
     chromaprint_dep,
+    aubio_dep,
     memory_dep,
     fmt_dep,
+    keyfinder_dep,
     protocol_dep,
+    rubberband_dep,
   ],
   link_args: link_args,
   build_by_default: not get_option('fuzzer'),
