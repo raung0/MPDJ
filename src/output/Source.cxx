@@ -3,6 +3,8 @@
 
 #include "Source.hxx"
 #include "MusicChunk.hxx"
+#include "pcm/Buffer.hxx"
+#include "pcm/PcmFormat.hxx"
 #include "filter/Filter.hxx"
 #include "filter/Prepared.hxx"
 #include "filter/plugins/ReplayGainFilterPlugin.hxx"
@@ -13,6 +15,8 @@
 #include "thread/ScopeUnlock.hxx"
 
 #include <string.h>
+
+#include <cmath>
 
 AudioOutputSource::AudioOutputSource() noexcept = default;
 AudioOutputSource::~AudioOutputSource() noexcept = default;
@@ -187,9 +191,38 @@ AudioOutputSource::FilterChunk(const MusicChunk &chunk)
 
 		void *dest = cross_fade_buffer.Get(other_data.size());
 		memcpy(dest, other_data.data(), other_data.size());
-		if (!pcm_mix(cross_fade_dither, dest, data.data(), data.size(),
-			     in_audio_format.format,
-			     mix_ratio))
+		if (mix_ratio >= 0) {
+			PcmBuffer old_buffer;
+			PcmBuffer new_buffer;
+			auto old_float = pcm_convert_to_float(old_buffer, in_audio_format.format,
+							    data);
+			auto new_float = pcm_convert_to_float(new_buffer, in_audio_format.format,
+							    other_data.first(data.size()));
+			if (old_float.size() != new_float.size())
+				throw FmtRuntimeError("Cannot cross-fade format {}",
+						      in_audio_format.format);
+
+			constexpr float HALF_PI = 1.5707963267948966f;
+			const float angle = mix_ratio * HALF_PI;
+			const float gain_new = std::sin(angle);
+			const float gain_old = std::cos(angle);
+
+			std::vector<float> mixed(old_float.size());
+			for (size_t i = 0; i < mixed.size(); ++i)
+				mixed[i] = new_float[i] * gain_new + old_float[i] * gain_old;
+
+			PcmBuffer out_buffer;
+			auto mixed_raw = pcm_convert_from_float(out_buffer,
+							    in_audio_format.format,
+							    mixed);
+			if (mixed_raw.empty())
+				throw FmtRuntimeError("Cannot cross-fade format {}",
+						      in_audio_format.format);
+
+			memcpy(dest, mixed_raw.data(), mixed_raw.size());
+		} else if (!pcm_mix(cross_fade_dither, dest, data.data(), data.size(),
+				     in_audio_format.format,
+				     mix_ratio))
 			throw FmtRuntimeError("Cannot cross-fade format {}",
 					      in_audio_format.format);
 

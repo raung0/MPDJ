@@ -2,10 +2,12 @@
 // Copyright The Music Player Daemon Project
 
 #include "Playlist.hxx"
+#include "PlaylistError.hxx"
 #include "db/Interface.hxx"
 #include "song/LightSong.hxx"
 #include "song/DetachedSong.hxx"
 #include "time/ChronoUtil.hxx"
+#include "Log.hxx"
 
 static bool
 UpdatePlaylistSong(const Database &db, DetachedSong &song)
@@ -48,6 +50,12 @@ UpdatePlaylistSong(const Database &db, DetachedSong &song)
 	song.SetBpm(original->bpm);
 	song.SetKey(original->key);
 	song.SetBeats(original->beats);
+
+	FmtDebug(playlist_domain,
+		 "updated analysis in live queue {:?}: bpm={} beats={}",
+		 song.GetURI(),
+		 song.GetBpm().has_value() ? "yes" : "no",
+		 song.GetBeats().size());
 
 	db.ReturnSong(original);
 	return true;

@@ -24,6 +24,13 @@ merge_song_metadata(DetachedSong &add, const DetachedSong &base) noexcept
 		add.SetTag(builder.Commit());
 	}
 
+	if (!add.GetBpm())
+		add.SetBpm(base.GetBpm());
+	if (add.GetKey().empty())
+		add.SetKey(base.GetKey());
+	if (add.GetBeats().empty())
+		add.SetBeats(base.GetBeats());
+
 	add.SetLastModified(base.GetLastModified());
 	add.SetAdded(base.GetAdded());
 
