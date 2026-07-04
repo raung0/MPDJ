@@ -19,6 +19,7 @@
           mesonFlags = old.mesonFlags ++ [
             "-Daubio=enabled"
             "-Dlibkeyfinder=enabled"
+            "-Dmikmod=disabled"
           ];
 
           buildInputs = old.buildInputs ++ [
