@@ -16,6 +16,11 @@
         mpd-local = pkgs.mpd.overrideAttrs (old: {
           src = ./.;
 
+          mesonFlags = old.mesonFlags ++ [
+            "-Daubio=enabled"
+            "-Dlibkeyfinder=enabled"
+          ];
+
           buildInputs = old.buildInputs ++ [
             pkgs.rubberband
             pkgs.libkeyfinder
