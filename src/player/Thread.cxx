@@ -61,7 +61,113 @@ struct AutomixPlan {
 	unsigned phrase_beats;
 	SongTime transition_start;
 	std::optional<float> time_ratio;
+	float eq_strength;
 };
+
+struct AutomixEqState {
+	std::vector<float> lowpass;
+
+	void Reset() noexcept {
+		lowpass.clear();
+	}
+};
+
+static float
+ComputeAutomixEqStrength(const DetachedSong &current, const DetachedSong &next,
+				 unsigned phrase_beats, double best_error) noexcept
+{
+	const double beat_score = std::clamp(
+		std::min(current.GetBeats().size(), next.GetBeats().size()) / 128.0,
+		0.0, 1.0);
+	const double phrase_score = phrase_beats >= 64 ? 1.0
+		: phrase_beats >= 32 ? 0.7
+		: 0.45;
+	const double ratio_score = best_error <= 0.15
+		? 1.0 - best_error / 0.15
+		: 0.0;
+
+	const double strength = 0.20 + ratio_score * 0.50 + beat_score * 0.20 +
+		phrase_score * 0.10;
+	return std::clamp((float)strength, 0.15f, 0.85f);
+}
+
+static void
+ApplyAutomixEq(std::span<float> samples, const AudioFormat &audio_format,
+	       float phase, float strength, AutomixEqState &state,
+	       bool incoming) noexcept
+{
+	if (samples.empty() || strength <= 0.0f)
+		return;
+
+	const unsigned channels = audio_format.channels;
+	if (channels == 0)
+		return;
+
+	if (state.lowpass.size() != channels)
+		state.lowpass.assign(channels, 0.0f);
+
+	phase = std::clamp(phase, 0.0f, 1.0f);
+
+	/* Slightly lower the bass shelf cutoff for more dramatic transitions. */
+	const float cutoff_hz = 150.0f + 180.0f * strength;
+	const float alpha = 1.0f - std::exp(-6.28318530717958647692f * cutoff_hz /
+					   (float)audio_format.sample_rate);
+
+	const float bass_gain = incoming
+		? (1.0f - strength + strength * phase)
+		: (1.0f - strength * phase);
+	const float treble_gain = 1.0f + 0.06f * strength * (incoming
+		? (1.0f - phase)
+		: phase);
+
+	for (size_t i = 0; i < samples.size(); i += channels)
+		for (unsigned ch = 0; ch < channels; ++ch) {
+			float &low = state.lowpass[ch];
+			const float x = samples[i + ch];
+
+			low += alpha * (x - low);
+			const float high = x - low;
+			samples[i + ch] = high * treble_gain + low * bass_gain;
+		}
+}
+
+static MusicChunkPtr
+AutomixEqChunk(MusicBuffer &buffer, const MusicChunk &src,
+	       const AudioFormat &audio_format, float phase,
+	       float eq_strength, AutomixEqState &eq_state, bool incoming)
+{
+	PcmBuffer temp;
+	auto float_data = pcm_convert_to_float(temp, audio_format.format,
+					      src.ReadData());
+	if (float_data.empty())
+		return nullptr;
+
+	std::vector<float> samples(float_data.begin(), float_data.end());
+	ApplyAutomixEq(samples, audio_format, phase, eq_strength, eq_state,
+		       incoming);
+
+	PcmBuffer out_temp;
+	auto raw = pcm_convert_from_float(out_temp, audio_format.format,
+					 samples);
+	if (raw.empty())
+		return nullptr;
+
+	auto dest = buffer.Allocate();
+	if (!dest)
+		return nullptr;
+
+	auto writable = dest->Write(audio_format, SongTime::Cast(src.time), src.bit_rate);
+	const size_t nbytes = std::min(writable.size(), raw.size());
+	std::copy(raw.begin(), raw.begin() + nbytes, writable.begin());
+	dest->Expand(audio_format, nbytes);
+	dest->tag = src.tag ? std::make_unique<Tag>(*src.tag) : nullptr;
+	dest->replay_gain_info = src.replay_gain_info;
+	dest->replay_gain_serial = src.replay_gain_serial;
+	dest->mix_ratio = src.mix_ratio;
+	dest->automix = src.automix;
+	dest->automix_time_ratio = src.automix_time_ratio;
+	return dest;
+}
 
 static void
 LogAutomixPlan(const DetachedSong &current, const DetachedSong &next,
@@ -69,15 +175,17 @@ LogAutomixPlan(const DetachedSong &current, const DetachedSong &next,
 {
 	if (plan.time_ratio)
 		FmtDebug(player_domain,
-			 "automix plan current={:?} next={:?} phrase_beats={} transition_start={} ratio={} chunks={}",
+			 "automix plan current={:?} next={:?} phrase_beats={} transition_start={} ratio={} eq_strength={} chunks={}",
 			 current.GetURI(), next.GetURI(), plan.phrase_beats,
 			 plan.transition_start.ToDoubleS(), *plan.time_ratio,
+			 plan.eq_strength,
 			 cross_fade_chunks);
 	else
 		FmtDebug(player_domain,
-			 "automix plan current={:?} next={:?} phrase_beats={} transition_start={} ratio=none chunks={}",
+			 "automix plan current={:?} next={:?} phrase_beats={} transition_start={} ratio=none eq_strength={} chunks={}",
 			 current.GetURI(), next.GetURI(), plan.phrase_beats,
-			 plan.transition_start.ToDoubleS(), cross_fade_chunks);
+			 plan.transition_start.ToDoubleS(), plan.eq_strength,
+			 cross_fade_chunks);
 }
 
 static std::optional<AutomixPlan>
@@ -156,6 +264,7 @@ GetAutomixPlan(const DetachedSong &current,
 			phrase_beats,
 			SongTime::FromS(current_beats[start_index]),
 			ratio,
+			ComputeAutomixEqStrength(current, next, phrase_beats, best_error),
 		};
 	}
 
@@ -165,9 +274,10 @@ GetAutomixPlan(const DetachedSong &current,
 #ifdef ENABLE_RUBBERBAND
 static MusicChunkPtr
 AutomixChunk(MusicBuffer &buffer, const MusicChunk &src,
-	     const AudioFormat &audio_format, float time_ratio)
+	     const AudioFormat &audio_format, float time_ratio,
+	     float eq_strength, float phase, AutomixEqState &eq_state)
 {
-	if (time_ratio <= 0.0f)
+	if (time_ratio <= 0.0f || eq_strength <= 0.0f)
 		return nullptr;
 
 	PcmBuffer temp;
@@ -224,6 +334,9 @@ AutomixChunk(MusicBuffer &buffer, const MusicChunk &src,
 		for (unsigned ch = 0; ch < channels; ++ch)
 			interleaved[frame * channels + ch] = output_channels[ch][frame];
 
+	ApplyAutomixEq(interleaved, audio_format, phase, eq_strength,
+		       eq_state, true);
+
 	PcmBuffer out_temp;
 	auto raw = pcm_convert_from_float(out_temp, audio_format.format,
 					 interleaved);
@@ -241,6 +354,7 @@ AutomixChunk(MusicBuffer &buffer, const MusicChunk &src,
 	dest->tag = src.tag ? std::make_unique<Tag>(*src.tag) : nullptr;
 	dest->replay_gain_info = src.replay_gain_info;
 	dest->replay_gain_serial = src.replay_gain_serial;
+	dest->mix_ratio = src.mix_ratio;
 	dest->automix = src.automix;
 	dest->automix_time_ratio = src.automix_time_ratio;
 	return dest;
@@ -355,6 +469,9 @@ class Player {
 	unsigned cross_fade_chunks = 0;
 
 	std::optional<float> automix_time_ratio;
+	std::optional<float> automix_eq_strength;
+	AutomixEqState automix_eq_outgoing;
+	AutomixEqState automix_eq_incoming;
 
 	/**
 	 * The current audio format for the audio outputs.
@@ -393,9 +510,16 @@ private:
 	 * Reset cross-fading to the initial state.  A check to
 	 * re-enable it at an appropriate time will be scheduled.
 	 */
+	void ResetAutomixTransition() noexcept {
+		automix_time_ratio.reset();
+		automix_eq_strength.reset();
+		automix_eq_outgoing.Reset();
+		automix_eq_incoming.Reset();
+	}
+
 	void ResetCrossFade() noexcept {
 		xfade_state = CrossFadeState::UNKNOWN;
-		automix_time_ratio.reset();
+		ResetAutomixTransition();
 	}
 
 	template<typename P>
@@ -1090,6 +1214,7 @@ Player::CheckCrossFade() noexcept
 		const auto plan = GetAutomixPlan(*song, *dc.song);
 		if (plan) {
 			automix_time_ratio = plan->time_ratio;
+			automix_eq_strength = plan->eq_strength;
 
 			const auto song_duration = song->GetDuration();
 			if (song_duration.IsNegative())
@@ -1105,24 +1230,27 @@ Player::CheckCrossFade() noexcept
 				cross_fade_chunks = max_chunks;
 			if (plan->time_ratio)
 				FmtDebug(player_domain,
-					 "automix ratio accepted current={:?} next={:?} ratio={}",
-					 song->GetURI(), dc.song->GetURI(), *plan->time_ratio);
+					 "automix ratio accepted current={:?} next={:?} ratio={} eq_strength={}",
+					 song->GetURI(), dc.song->GetURI(), *plan->time_ratio,
+					 plan->eq_strength);
 			else
 				FmtDebug(player_domain,
-					 "automix ratio rejected current={:?} next={:?}",
-					 song->GetURI(), dc.song->GetURI());
+					 "automix ratio rejected current={:?} next={:?} eq_strength={}",
+					 song->GetURI(), dc.song->GetURI(), plan->eq_strength);
 			LogAutomixPlan(*song, *dc.song, *plan, cross_fade_chunks);
 			if (cross_fade_chunks > 0)
 				xfade_state = CrossFadeState::ENABLED;
-			else
+			else {
 				xfade_state = CrossFadeState::DISABLED;
+				ResetAutomixTransition();
+			}
 			return;
 		}
 
 		FmtDebug(player_domain,
 			 "automix plan unavailable current={:?} next={:?}",
 			 song->GetURI(), dc.song->GetURI());
-		automix_time_ratio.reset();
+		ResetAutomixTransition();
 	}
 
 	if (!pc.cross_fade.CanCrossFade(pc.total_time, dc.total_time,
@@ -1131,6 +1259,7 @@ Player::CheckCrossFade() noexcept
 		/* cross fading is disabled or the next song is too
 		   short */
 		xfade_state = CrossFadeState::DISABLED;
+		ResetAutomixTransition();
 		return;
 	}
 
@@ -1147,9 +1276,8 @@ Player::CheckCrossFade() noexcept
 	if (cross_fade_chunks > 0)
 		xfade_state = CrossFadeState::ENABLED;
 	else
-		// TODO: eliminate this "else" branch
 		xfade_state = CrossFadeState::DISABLED;
-	automix_time_ratio.reset();
+	ResetAutomixTransition();
 }
 
 inline void
@@ -1249,6 +1377,17 @@ Player::PlayNextChunk() noexcept
 				chunk->automix_time_ratio = *automix_time_ratio;
 			}
 
+			const float automix_phase = 1.0f - static_cast<float>(cross_fade_position)
+								    / static_cast<float>(cross_fade_chunks);
+
+			if (pc.GetAutomix() && automix_time_ratio && automix_eq_strength) {
+				auto transformed = AutomixEqChunk(buffer, *chunk, play_audio_format,
+								 automix_phase, *automix_eq_strength,
+								 automix_eq_outgoing, false);
+				if (transformed != nullptr)
+					chunk = std::move(transformed);
+			}
+
 			if (other_chunk->IsEmpty()) {
 				/* the "other" chunk was a MusicChunk
 				   which had only a tag, but no music
@@ -1260,14 +1399,26 @@ Player::PlayNextChunk() noexcept
 				other_chunk.reset();
 			}
 
-			if (other_chunk && pc.GetAutomix() && automix_time_ratio) {
+			if (other_chunk && pc.GetAutomix() && automix_time_ratio &&
+			    automix_eq_strength) {
+				MusicChunkPtr transformed;
 #ifdef ENABLE_RUBBERBAND
-				auto transformed = AutomixChunk(buffer, *other_chunk,
-								 play_audio_format,
-								 *automix_time_ratio);
+				transformed = AutomixChunk(buffer, *other_chunk,
+							   play_audio_format,
+							   *automix_time_ratio,
+							   *automix_eq_strength,
+							   automix_phase,
+							   automix_eq_incoming);
+#else
+				transformed = AutomixEqChunk(buffer, *other_chunk,
+							     play_audio_format,
+							     automix_phase,
+							     *automix_eq_strength,
+							     automix_eq_incoming,
+							     true);
+#endif
 				if (transformed != nullptr)
 					other_chunk = std::move(transformed);
-#endif
 			}
 
 			chunk->other = std::move(other_chunk);
