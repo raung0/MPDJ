@@ -448,6 +448,12 @@ public:
 
 	void LockPauseAsync() noexcept;
 
+	/**
+	 * Interrupt any blocking output operation without waiting for it
+	 * to finish.
+	 */
+	void Interrupt() noexcept;
+
 	void CloseWait(std::unique_lock<Mutex> &lock) noexcept;
 	void LockCloseWait() noexcept;
 

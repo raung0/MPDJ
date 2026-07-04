@@ -152,38 +152,47 @@ struct Partition final : QueueListener, PlayerListener, MixerListener {
 	}
 
 	void Stop() noexcept {
+		outputs.Interrupt();
 		playlist.Stop(pc);
 	}
 
 	void PlayAny() {
+		outputs.Interrupt();
 		return playlist.PlayAny(pc);
 	}
 
 	void PlayPosition(int position) {
+		outputs.Interrupt();
 		return playlist.PlayPosition(pc, position);
 	}
 
 	void PlayId(int id) {
+		outputs.Interrupt();
 		return playlist.PlayId(pc, id);
 	}
 
 	void PlayNext() {
+		outputs.Interrupt();
 		return playlist.PlayNext(pc);
 	}
 
 	void PlayPrevious() {
+		outputs.Interrupt();
 		return playlist.PlayPrevious(pc);
 	}
 
 	void SeekSongPosition(unsigned song_position, SongTime seek_time) {
+		outputs.Interrupt();
 		playlist.SeekSongPosition(pc, song_position, seek_time);
 	}
 
 	void SeekSongId(unsigned song_id, SongTime seek_time) {
+		outputs.Interrupt();
 		playlist.SeekSongId(pc, song_id, seek_time);
 	}
 
 	void SeekCurrent(SignedSongTime seek_time, bool relative) {
+		outputs.Interrupt();
 		playlist.SeekCurrent(pc, seek_time, relative);
 	}
 

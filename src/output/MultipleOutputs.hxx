@@ -146,6 +146,12 @@ public:
 	 */
 	void SetSoftwareVolume(unsigned volume) noexcept;
 
+	/**
+	 * Interrupt all output devices without waiting for the current
+	 * operation to finish.
+	 */
+	void Interrupt() noexcept;
+
 private:
 	/**
 	 * Was Open() called successfully?

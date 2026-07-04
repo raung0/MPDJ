@@ -296,6 +296,13 @@ MultipleOutputs::CheckPipe() noexcept
 }
 
 void
+MultipleOutputs::Interrupt() noexcept
+{
+	for (const auto &ao : outputs)
+		ao->Interrupt();
+}
+
+void
 MultipleOutputs::Pause() noexcept
 {
 	Update(false);

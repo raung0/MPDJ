@@ -217,6 +217,13 @@ AudioOutputControl::DisableAsync() noexcept
 }
 
 void
+AudioOutputControl::Interrupt() noexcept
+{
+	if (output)
+		output->Interrupt();
+}
+
+void
 AudioOutputControl::EnableDisableAsync()
 {
 	if (enabled == really_enabled)

@@ -78,6 +78,13 @@ class AudioOutputSource {
 	PcmDither cross_fade_dither;
 
 	/**
+	 * Previous positive cross-fade ratio.  Used to turn MPD's
+	 * chunk-level cross-fade steps into a per-sample ramp, which avoids
+	 * clicks/jumps when automix transitions across converted streams.
+	 */
+	float cross_fade_previous_mix_ratio = -1.0f;
+
+	/**
 	 * The filter object of this audio output.  This is an
 	 * instance of chain_filter_plugin.
 	 */

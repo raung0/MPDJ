@@ -26,6 +26,7 @@
 #include "MusicPipe.hxx"
 #include "MusicBuffer.hxx"
 #include "pcm/Buffer.hxx"
+#include "pcm/Convert.hxx"
 #include "MusicChunk.hxx"
 #include "pcm/PcmFormat.hxx"
 #include "pcm/Traits.hxx"
@@ -37,6 +38,7 @@
 #include "thread/Name.hxx"
 #include "thread/ScopeUnlock.hxx"
 #include "Log.hxx"
+#include "lib/fmt/AudioFormatFormatter.hxx"
 
 #include <exception>
 #include <cmath>
@@ -57,6 +59,111 @@ static constexpr Domain player_domain("player");
  */
 static constexpr auto buffer_before_play_duration = std::chrono::seconds(1);
 
+static size_t
+AutomixFrameCount(const MusicChunk &chunk, const AudioFormat &format) noexcept
+{
+	const auto frame_size = format.GetFrameSize();
+	return frame_size > 0 ? chunk.length / frame_size : 0;
+}
+
+
+static constexpr float AUTOMIX_SILENCE_LEVEL = 0.00316227766f; // -50 dBFS
+static constexpr unsigned AUTOMIX_PREROLL_MS = 5;
+static constexpr unsigned AUTOMIX_MAX_SILENCE_TRIM_MS = 3000;
+
+static float
+AutomixFramePeak(std::span<const float> samples, unsigned channels,
+		 size_t frame) noexcept
+{
+	float peak = 0.0f;
+	for (unsigned ch = 0; ch < channels; ++ch)
+		peak = std::max(peak, std::abs(samples[frame * channels + ch]));
+	return peak;
+}
+
+static float
+AutomixRms(std::span<const float> samples) noexcept
+{
+	if (samples.empty())
+		return 0.0f;
+
+	double sum = 0.0;
+	for (float sample : samples)
+		sum += double(sample) * double(sample);
+
+	return static_cast<float>(std::sqrt(sum / samples.size()));
+}
+
+static size_t
+AutomixLeadingSilentFrames(std::span<const float> samples,
+			   const AudioFormat &format) noexcept
+{
+	const unsigned channels = format.channels;
+	if (channels == 0 || samples.size() < channels)
+		return 0;
+
+	const size_t frames = samples.size() / channels;
+	const size_t max_trim_frames = std::min<size_t>(frames,
+		format.sample_rate * AUTOMIX_MAX_SILENCE_TRIM_MS / 1000);
+	const size_t preroll_frames = format.sample_rate * AUTOMIX_PREROLL_MS / 1000;
+
+	size_t trim_frames = 0;
+	while (trim_frames < max_trim_frames &&
+	       AutomixFramePeak(samples, channels, trim_frames) < AUTOMIX_SILENCE_LEVEL)
+		++trim_frames;
+
+	if (trim_frames <= preroll_frames)
+		return 0;
+
+	return trim_frames - preroll_frames;
+}
+
+static void
+AutomixTrimLeadingSilence(std::vector<std::byte> &bytes,
+			 const AudioFormat &format,
+			 const char *label) noexcept
+{
+	if (bytes.empty())
+		return;
+
+	PcmBuffer temp;
+	auto samples = pcm_convert_to_float(temp, format.format,
+		std::span<const std::byte>(bytes.data(), bytes.size()));
+	const size_t trim_frames = AutomixLeadingSilentFrames(samples, format);
+	if (trim_frames == 0)
+		return;
+
+	const size_t trim_bytes = std::min(bytes.size(),
+		trim_frames * format.GetFrameSize());
+	bytes.erase(bytes.begin(), bytes.begin() + trim_bytes);
+	FmtDebug(player_domain,
+		 "automix trim leading silence label={} frames={} bytes={} remaining_bytes={}",
+		 label, trim_frames, trim_bytes, bytes.size());
+}
+
+static void
+LogAutomixChunk(const char *label, const MusicChunk *chunk,
+		const AudioFormat &format) noexcept
+{
+	if (chunk == nullptr) {
+		FmtDebug(player_domain, "automix {} chunk=null format={}", label, format);
+		return;
+	}
+
+	FmtDebug(player_domain,
+		 "automix {} chunk length={} frames={} time={} bitrate={} mix_ratio={} automix={} ratio={} has_other={} empty={} format={} check={}",
+		 label, chunk->length, AutomixFrameCount(*chunk, format),
+		 chunk->time.ToDoubleS(), chunk->bit_rate, chunk->mix_ratio,
+		 chunk->automix, chunk->automix_time_ratio,
+		 chunk->other != nullptr, chunk->IsEmpty(), format,
+#ifndef NDEBUG
+		 chunk->CheckFormat(format)
+#else
+		 true
+#endif
+	);
+}
+
 struct AutomixPlan {
 	unsigned phrase_beats;
 	SongTime transition_start;
@@ -66,10 +173,67 @@ struct AutomixPlan {
 
 struct AutomixEqState {
 	std::vector<float> lowpass;
+	std::unique_ptr<PcmConvert> convert;
+	AudioFormat convert_src_format = AudioFormat::Undefined();
+	AudioFormat convert_dst_format = AudioFormat::Undefined();
+	std::vector<std::byte> automix_pending;
+
+#ifdef ENABLE_RUBBERBAND
+	std::unique_ptr<RubberBand::RubberBandStretcher> stretcher;
+	AudioFormat stretcher_src_format = AudioFormat::Undefined();
+	AudioFormat stretcher_dst_format = AudioFormat::Undefined();
+	float stretcher_time_ratio = 0.0f;
+	std::vector<std::byte> stretcher_pending;
+	size_t stretcher_pending_offset = 0;
+	size_t stretcher_start_delay = 0;
+#endif
 
 	void Reset() noexcept {
 		lowpass.clear();
+		convert.reset();
+		convert_src_format.Clear();
+		convert_dst_format.Clear();
+		automix_pending.clear();
+
+#ifdef ENABLE_RUBBERBAND
+		stretcher.reset();
+		stretcher_src_format.Clear();
+		stretcher_dst_format.Clear();
+		stretcher_time_ratio = 0.0f;
+		stretcher_pending.clear();
+		stretcher_pending_offset = 0;
+		stretcher_start_delay = 0;
+#endif
 	}
+
+	std::span<const std::byte> Convert(const MusicChunk &src,
+					  const AudioFormat &src_format,
+					  const AudioFormat &dst_format) {
+		if (!convert || convert_src_format != src_format ||
+		    convert_dst_format != dst_format) {
+			convert = std::make_unique<PcmConvert>(src_format, dst_format);
+			convert_src_format = src_format;
+			convert_dst_format = dst_format;
+		}
+
+		return convert->Convert(src.ReadData());
+	}
+
+#ifdef ENABLE_RUBBERBAND
+	void AppendStretcherOutput(std::span<const std::byte> output) {
+		if (output.empty())
+			return;
+
+		if (stretcher_pending_offset > 0 &&
+		    stretcher_pending_offset == stretcher_pending.size()) {
+			stretcher_pending.clear();
+			stretcher_pending_offset = 0;
+		}
+
+		stretcher_pending.insert(stretcher_pending.end(),
+					 output.begin(), output.end());
+	}
+#endif
 };
 
 static float
@@ -133,39 +297,57 @@ ApplyAutomixEq(std::span<float> samples, const AudioFormat &audio_format,
 
 static MusicChunkPtr
 AutomixEqChunk(MusicBuffer &buffer, const MusicChunk &src,
-	       const AudioFormat &audio_format, float phase,
+	       const AudioFormat &src_format, const AudioFormat &dst_format,
+	       float phase,
 	       float eq_strength, AutomixEqState &eq_state, bool incoming)
 {
-	PcmBuffer temp;
-	auto float_data = pcm_convert_to_float(temp, audio_format.format,
-					      src.ReadData());
-	if (float_data.empty())
+	FmtDebug(player_domain,
+		 "automix eq enter incoming={} phase={} strength={} src_format={} dst_format={}",
+		 incoming, phase, eq_strength, src_format, dst_format);
+	LogAutomixChunk(incoming ? "eq-src-incoming" : "eq-src-outgoing", &src, src_format);
+	auto converted = eq_state.Convert(src, src_format, dst_format);
+	if (converted.empty()) {
+		FmtDebug(player_domain, "automix eq failed reason=convert-empty incoming={}", incoming);
 		return nullptr;
+	}
+
+	PcmBuffer temp;
+	auto float_data = pcm_convert_to_float(temp, dst_format.format,
+					      converted);
+	if (float_data.empty()) {
+		FmtDebug(player_domain, "automix rubberband failed reason=float-empty converted_bytes={}", converted.size());
+		return nullptr;
+	}
 
 	std::vector<float> samples(float_data.begin(), float_data.end());
-	ApplyAutomixEq(samples, audio_format, phase, eq_strength, eq_state,
+	ApplyAutomixEq(samples, dst_format, phase, eq_strength, eq_state,
 		       incoming);
 
 	PcmBuffer out_temp;
-	auto raw = pcm_convert_from_float(out_temp, audio_format.format,
+	auto raw = pcm_convert_from_float(out_temp, dst_format.format,
 					 samples);
-	if (raw.empty())
+	if (raw.empty()) {
+		FmtDebug(player_domain, "automix eq failed reason=raw-empty incoming={} samples={}", incoming, samples.size());
 		return nullptr;
+	}
 
 	auto dest = buffer.Allocate();
-	if (!dest)
+	if (!dest) {
+		FmtDebug(player_domain, "automix eq failed reason=allocate incoming={}", incoming);
 		return nullptr;
+	}
 
-	auto writable = dest->Write(audio_format, SongTime::Cast(src.time), src.bit_rate);
+	auto writable = dest->Write(dst_format, SongTime::Cast(src.time), src.bit_rate);
 	const size_t nbytes = std::min(writable.size(), raw.size());
 	std::copy(raw.begin(), raw.begin() + nbytes, writable.begin());
-	dest->Expand(audio_format, nbytes);
+	dest->Expand(dst_format, nbytes);
 	dest->tag = src.tag ? std::make_unique<Tag>(*src.tag) : nullptr;
 	dest->replay_gain_info = src.replay_gain_info;
 	dest->replay_gain_serial = src.replay_gain_serial;
 	dest->mix_ratio = src.mix_ratio;
 	dest->automix = src.automix;
 	dest->automix_time_ratio = src.automix_time_ratio;
+	LogAutomixChunk(incoming ? "eq-dst-incoming" : "eq-dst-outgoing", dest.get(), dst_format);
 	return dest;
 }
 
@@ -215,6 +397,10 @@ GetAutomixPlan(const DetachedSong &current,
 
 	const auto &current_beats = current.GetBeats();
 	const auto &next_beats = next.GetBeats();
+	FmtDebug(player_domain,
+		 "automix inspect current={:?} next={:?} current_bpm={} next_bpm={} current_beats={} next_beats={}",
+		 current.GetURI(), next.GetURI(), *current_bpm, *next_bpm,
+		 current_beats.size(), next_beats.size());
 	for (unsigned phrase_beats : { 64u, 32u, 16u }) {
 		if (current_beats.size() <= phrase_beats || next_beats.size() <= phrase_beats) {
 			FmtDebug(player_domain,
@@ -251,6 +437,39 @@ GetAutomixPlan(const DetachedSong &current,
 			continue;
 		}
 
+		double transition_start = current_beats[start_index];
+		const auto duration = current.GetDuration();
+		if (!duration.IsNegative()) {
+			/*
+			 * The last phrase boundary can land inside a long outro fade.
+			 * That technically creates a crossfade, but the user hears the old
+			 * song finish its own fade before the next track becomes audible.
+			 * Keep at least this much real overlap by pulling the start point
+			 * back to the latest beat before the fade-only tail.
+			 */
+			static constexpr double MIN_AUDIBLE_OVERLAP = 16.0;
+			const double latest_start =
+				std::max(0.0, duration.ToDoubleS() - MIN_AUDIBLE_OVERLAP);
+
+			if (transition_start > latest_start) {
+				std::size_t adjusted_index = start_index;
+				while (adjusted_index > 0 &&
+				       current_beats[adjusted_index] > latest_start)
+					--adjusted_index;
+
+				const double adjusted_start = adjusted_index > 0
+					? current_beats[adjusted_index]
+					: latest_start;
+
+				FmtDebug(player_domain,
+					 "automix outro adjustment current={:?} next={:?} phrase_beats={} duration={} old_start={} new_start={} min_overlap={}",
+					 current.GetURI(), next.GetURI(), phrase_beats,
+					 duration.ToDoubleS(), transition_start, adjusted_start,
+					 MIN_AUDIBLE_OVERLAP);
+				transition_start = adjusted_start;
+			}
+		}
+
 		std::optional<float> ratio;
 		if (best_error <= 0.15)
 			ratio = static_cast<float>(best_ratio);
@@ -262,7 +481,7 @@ GetAutomixPlan(const DetachedSong &current,
 
 		return AutomixPlan{
 			phrase_beats,
-			SongTime::FromS(current_beats[start_index]),
+			SongTime::FromS(transition_start),
 			ratio,
 			ComputeAutomixEqStrength(current, next, phrase_beats, best_error),
 		};
@@ -271,25 +490,292 @@ GetAutomixPlan(const DetachedSong &current,
 	return std::nullopt;
 }
 
+
+static MusicChunkPtr
+AutomixMixChunk(MusicBuffer &buffer,
+	       const MusicChunk &current, const MusicChunk *incoming,
+	       const AudioFormat &current_format,
+	       const AudioFormat &incoming_format,
+	       const AudioFormat &mix_format,
+	       MusicPipe &incoming_pipe,
+	       float phase_start, float phase_end,
+	       float eq_strength,
+	       [[maybe_unused]] AutomixEqState &outgoing_eq_state,
+	       AutomixEqState &incoming_eq_state)
+{
+	FmtDebug(player_domain,
+		 "automix mix enter phase_start={} phase_end={} strength={} current_format={} incoming_format={} mix_format={}",
+		 phase_start, phase_end, eq_strength, current_format, incoming_format, mix_format);
+	LogAutomixChunk("mix-current-in", &current, current_format);
+	LogAutomixChunk("mix-incoming-in", incoming, incoming_format);
+	auto current_data = outgoing_eq_state.Convert(current, current_format, mix_format);
+	std::vector<std::byte> incoming_bytes;
+	if (!incoming_eq_state.automix_pending.empty()) {
+		FmtDebug(player_domain,
+			 "automix mix using pending incoming_bytes={}",
+			 incoming_eq_state.automix_pending.size());
+		incoming_bytes.insert(incoming_bytes.end(),
+			incoming_eq_state.automix_pending.begin(),
+			incoming_eq_state.automix_pending.end());
+		incoming_eq_state.automix_pending.clear();
+	}
+	if (incoming != nullptr) {
+		auto first = incoming_eq_state.Convert(*incoming, incoming_format, mix_format);
+		incoming_bytes.insert(incoming_bytes.end(), first.begin(), first.end());
+	}
+
+	/*
+	 * Decoder chunk sizes are byte-count based, not duration based.  In the
+	 * failing case A is 44.1 kHz/16-bit/stereo (1002 frames per chunk) while B
+	 * is 48 kHz/24-bit/stereo (501 frames per decoder chunk).  After converting
+	 * B to A's format, one B chunk covers only ~441-460 frames.  Mixing exactly
+	 * one B chunk per one A chunk makes B advance at roughly half speed and
+	 * sounds slow/choppy.  Pull enough incoming chunks to cover the current
+	 * chunk's duration before mixing.
+	 */
+	unsigned pulled_extra = 0;
+	auto pull_more_incoming = [&] {
+		while (incoming_bytes.size() < current_data.size() && incoming_pipe.GetSize() > 0) {
+			auto extra = incoming_pipe.Shift();
+			if (extra == nullptr)
+				break;
+
+			LogAutomixChunk("mix-incoming-extra", extra.get(), incoming_format);
+			if (extra->IsEmpty())
+				continue;
+
+			auto converted = incoming_eq_state.Convert(*extra, incoming_format, mix_format);
+			incoming_bytes.insert(incoming_bytes.end(), converted.begin(), converted.end());
+			++pulled_extra;
+		}
+	};
+
+	pull_more_incoming();
+	AutomixTrimLeadingSilence(incoming_bytes, mix_format, "incoming");
+	pull_more_incoming();
+
+	FmtDebug(player_domain,
+		 "automix mix converted current_bytes={} incoming_bytes={} pulled_extra={} remaining_next_pipe={}",
+		 current_data.size(), incoming_bytes.size(), pulled_extra, incoming_pipe.GetSize());
+	if (current_data.empty() || incoming_bytes.empty()) {
+		FmtDebug(player_domain, "automix mix failed reason=convert-empty");
+		return nullptr;
+	}
+
+	PcmBuffer current_temp;
+	PcmBuffer incoming_temp;
+	auto current_float = pcm_convert_to_float(current_temp, mix_format.format,
+						 current_data);
+	auto incoming_float = pcm_convert_to_float(incoming_temp, mix_format.format,
+						  std::span<const std::byte>(incoming_bytes.data(), incoming_bytes.size()));
+	if (current_float.empty() || incoming_float.empty()) {
+		FmtDebug(player_domain,
+			 "automix mix failed reason=float-empty current_samples={} incoming_samples={}",
+			 current_float.size(), incoming_float.size());
+		return nullptr;
+	}
+
+	const unsigned channels = mix_format.channels;
+	if (channels == 0 || current_float.size() % channels != 0 ||
+	    incoming_float.size() % channels != 0)
+		return nullptr;
+
+	const size_t current_frames = current_float.size() / channels;
+	const size_t incoming_frames = incoming_float.size() / channels;
+	const size_t overlap_frames = std::min(current_frames, incoming_frames);
+	if (overlap_frames == 0) {
+		FmtDebug(player_domain, "automix mix failed reason=zero-overlap");
+		return nullptr;
+	}
+
+	const size_t overlap_samples = overlap_frames * channels;
+	const float current_overlap_rms = AutomixRms(
+		std::span<const float>(current_float.data(), overlap_samples));
+	const float incoming_overlap_rms = AutomixRms(
+		std::span<const float>(incoming_float.data(), overlap_samples));
+	const size_t overlap_bytes = mix_format.GetFrameSize() * overlap_frames;
+	const size_t incoming_tail_bytes = incoming_bytes.size() > overlap_bytes
+		? incoming_bytes.size() - overlap_bytes
+		: 0;
+	FmtDebug(player_domain,
+		 "automix mix overlap bytes={} frames={} current_tail_bytes={} incoming_tail_bytes={}",
+		 overlap_bytes, overlap_frames,
+		 current_data.size() > overlap_bytes ? current_data.size() - overlap_bytes : 0,
+		 incoming_tail_bytes);
+
+	if (incoming_tail_bytes > 0) {
+		/*
+		 * Keep converted-but-unmixed B samples for the next automix chunk.
+		 * Without this, pulling extra incoming decoder chunks to cover A's
+		 * duration fixes underfeeding but skips the unused B tail every
+		 * callback, making B sound choppy/fast-forwarded.
+		 */
+		incoming_eq_state.automix_pending.assign(incoming_bytes.begin() + overlap_bytes,
+						      incoming_bytes.end());
+		FmtDebug(player_domain,
+			 "automix mix saved pending incoming_bytes={}",
+			 incoming_eq_state.automix_pending.size());
+	}
+
+	/*
+	 * Preserve the outgoing chunk duration exactly.  Earlier automix code
+	 * returned only the overlapped prefix when the incoming decoder chunk was
+	 * shorter after format conversion (e.g. 48 kHz/24-bit B vs 44.1 kHz/16-bit
+	 * A).  That discarded the tail of A on every crossfade chunk, causing the
+	 * audible speed wobble/crackle.  Start with a full copy of A and mix B only
+	 * over the prefix that actually exists.
+	 */
+	std::vector<float> old_samples(current_float.begin(), current_float.end());
+	std::vector<float> new_samples(incoming_float.begin(), incoming_float.end());
+	ApplyAutomixEq(new_samples, mix_format, phase_start, eq_strength,
+		       incoming_eq_state, true);
+
+	phase_start = std::clamp(phase_start, 0.0f, 1.0f);
+	phase_end = std::clamp(phase_end, phase_start, 1.0f);
+
+	/*
+	 * Avoid crossfading silence/fades as if they were full-strength song
+	 * content.  If A has already faded down to near silence, move the fade
+	 * clock forward so B takes over smoothly.  If B has an authored fade-in,
+	 * give it a limited make-up gain so MPD does not double-fade it into
+	 * inaudibility.  The gain is capped to avoid exploding actual silence.
+	 */
+	if (current_overlap_rms < AUTOMIX_SILENCE_LEVEL &&
+	    incoming_overlap_rms >= AUTOMIX_SILENCE_LEVEL) {
+		phase_start = std::max(phase_start, 0.85f);
+		phase_end = std::max(phase_end, phase_start);
+	}
+
+	float incoming_makeup = 1.0f;
+	if (current_overlap_rms >= AUTOMIX_SILENCE_LEVEL &&
+	    incoming_overlap_rms >= AUTOMIX_SILENCE_LEVEL &&
+	    incoming_overlap_rms < current_overlap_rms)
+		incoming_makeup = std::clamp(
+			std::sqrt(current_overlap_rms / incoming_overlap_rms),
+			1.0f, 2.5f);
+
+	FmtDebug(player_domain,
+		 "automix envelope current_rms={} incoming_rms={} phase_start={} phase_end={} incoming_makeup={}",
+		 current_overlap_rms, incoming_overlap_rms, phase_start, phase_end,
+		 incoming_makeup);
+
+	constexpr float HALF_PI = 1.57079632679489661923f;
+	std::vector<float> mixed(old_samples);
+	for (size_t frame = 0; frame < overlap_frames; ++frame) {
+		const float pos = current_frames > 1
+			? static_cast<float>(frame) / static_cast<float>(current_frames - 1)
+			: 0.0f;
+		const float phase = phase_start + (phase_end - phase_start) * pos;
+		const float angle = phase * HALF_PI;
+		const float gain_old = std::cos(angle);
+		const float gain_new = std::min(1.0f, std::sin(angle) * incoming_makeup);
+
+		for (unsigned ch = 0; ch < channels; ++ch) {
+			const size_t i = frame * channels + ch;
+			mixed[i] = old_samples[i] * gain_old + new_samples[i] * gain_new;
+		}
+	}
+
+	PcmBuffer out_temp;
+	auto raw = pcm_convert_from_float(out_temp, mix_format.format, mixed);
+	if (raw.empty())
+		return nullptr;
+
+	auto dest = buffer.Allocate();
+	if (!dest)
+		return nullptr;
+
+	auto writable = dest->Write(mix_format, SongTime::Cast(current.time), current.bit_rate);
+	const size_t nbytes = std::min(writable.size(), raw.size());
+	std::copy(raw.begin(), raw.begin() + nbytes, writable.begin());
+	dest->Expand(mix_format, nbytes);
+	dest->tag = current.tag ? std::make_unique<Tag>(*current.tag) : nullptr;
+	dest->replay_gain_info = current.replay_gain_info;
+	dest->replay_gain_serial = current.replay_gain_serial;
+	dest->mix_ratio = current.mix_ratio;
+	dest->automix = true;
+	dest->automix_time_ratio = current.automix_time_ratio;
+	return dest;
+}
+
 #ifdef ENABLE_RUBBERBAND
 static MusicChunkPtr
 AutomixChunk(MusicBuffer &buffer, const MusicChunk &src,
-	     const AudioFormat &audio_format, float time_ratio,
+	     const AudioFormat &src_format, const AudioFormat &dst_format,
+	     float time_ratio,
 	     float eq_strength, float phase, AutomixEqState &eq_state)
 {
 	if (time_ratio <= 0.0f || eq_strength <= 0.0f)
 		return nullptr;
 
-	PcmBuffer temp;
-	auto float_data = pcm_convert_to_float(temp, audio_format.format,
-					      src.ReadData());
-	if (float_data.empty())
+	auto converted = eq_state.Convert(src, src_format, dst_format);
+	if (converted.empty())
 		return nullptr;
 
-	const unsigned channels = audio_format.channels;
+	PcmBuffer temp;
+	auto float_data = pcm_convert_to_float(temp, dst_format.format,
+					      converted);
+	if (float_data.empty()) {
+		FmtDebug(player_domain, "automix rubberband failed reason=float-empty converted_bytes={}", converted.size());
+		return nullptr;
+	}
+
+	/*
+	 * RubberBand's real-time stretcher has latency and may not have
+	 * produced enough output for this chunk yet.  Keep an EQ-only dry copy
+	 * available so the automix transition never injects zero-filled audio
+	 * while the stretcher is warming up.
+	 */
+	std::vector<float> dry_samples(float_data.begin(), float_data.end());
+	ApplyAutomixEq(dry_samples, dst_format, phase, eq_strength, eq_state, true);
+	PcmBuffer dry_temp;
+	auto dry_raw = pcm_convert_from_float(dry_temp, dst_format.format,
+					       dry_samples);
+
+	const unsigned channels = dst_format.channels;
 	const size_t frames = float_data.size() / channels;
 	if (frames == 0)
 		return nullptr;
+
+	const bool need_open = !eq_state.stretcher ||
+		eq_state.stretcher_src_format != src_format ||
+		eq_state.stretcher_dst_format != dst_format;
+
+	if (need_open) {
+		const RubberBand::RubberBandStretcher::Options options =
+			RubberBand::RubberBandStretcher::OptionProcessRealTime |
+			RubberBand::RubberBandStretcher::OptionEngineFiner |
+			RubberBand::RubberBandStretcher::OptionPitchHighConsistency |
+			RubberBand::RubberBandStretcher::OptionChannelsTogether;
+
+		eq_state.stretcher = std::make_unique<RubberBand::RubberBandStretcher>(
+			dst_format.sample_rate, channels, options, time_ratio, 1.0);
+		eq_state.stretcher_src_format = src_format;
+		eq_state.stretcher_dst_format = dst_format;
+		eq_state.stretcher_time_ratio = time_ratio;
+		eq_state.stretcher_pending.clear();
+		eq_state.stretcher_pending_offset = 0;
+		eq_state.stretcher_start_delay = 0;
+		eq_state.stretcher->setMaxProcessSize(4096);
+
+		const size_t pad = eq_state.stretcher->getPreferredStartPad();
+		if (pad > 0) {
+			std::vector<std::vector<float>> silence(channels,
+				std::vector<float>(pad, 0.0f));
+			std::vector<const float *> input_ptrs(channels);
+			for (unsigned ch = 0; ch < channels; ++ch)
+				input_ptrs[ch] = silence[ch].data();
+			eq_state.stretcher->process(input_ptrs.data(), pad, false);
+		}
+
+		eq_state.stretcher_start_delay =
+			eq_state.stretcher->getStartDelay();
+	}
+
+	if (eq_state.stretcher_time_ratio != time_ratio) {
+		eq_state.stretcher->setTimeRatio(time_ratio);
+		eq_state.stretcher_time_ratio = time_ratio;
+	}
 
 	std::vector<std::vector<float>> input_channels(channels,
 		std::vector<float>(frames));
@@ -301,56 +787,75 @@ AutomixChunk(MusicBuffer &buffer, const MusicChunk &src,
 	for (unsigned ch = 0; ch < channels; ++ch)
 		input_ptrs[ch] = input_channels[ch].data();
 
-	const RubberBand::RubberBandStretcher::Options options =
-		RubberBand::RubberBandStretcher::OptionProcessRealTime |
-		RubberBand::RubberBandStretcher::OptionEngineFaster |
-		RubberBand::RubberBandStretcher::OptionPitchHighConsistency |
-		RubberBand::RubberBandStretcher::OptionChannelsTogether;
+	eq_state.stretcher->process(input_ptrs.data(), frames, false);
 
-	RubberBand::RubberBandStretcher stretcher(audio_format.sample_rate,
-						  channels, options,
-						  time_ratio, 1.0);
-	stretcher.setMaxProcessSize(frames);
-	stretcher.process(input_ptrs.data(), frames, true);
-
-	const int available = stretcher.available();
-	if (available <= 0)
-		return nullptr;
-
-	std::vector<std::vector<float>> output_channels(channels,
-		std::vector<float>(available));
-	std::vector<float *> output_ptrs(channels);
-	for (unsigned ch = 0; ch < channels; ++ch) {
-		output_ptrs[ch] = output_channels[ch].data();
-	}
-
-	const auto retrieved = stretcher.retrieve(output_ptrs.data(), available);
-	if (retrieved <= 0)
-		return nullptr;
-
-	const size_t retrieved_frames = size_t(retrieved);
-	std::vector<float> interleaved(retrieved_frames * channels);
-	for (size_t frame = 0; frame < retrieved_frames; ++frame)
+	const int available = eq_state.stretcher->available();
+	if (available > 0) {
+		std::vector<std::vector<float>> output_channels(channels,
+			std::vector<float>(size_t(available)));
+		std::vector<float *> output_ptrs(channels);
 		for (unsigned ch = 0; ch < channels; ++ch)
-			interleaved[frame * channels + ch] = output_channels[ch][frame];
+			output_ptrs[ch] = output_channels[ch].data();
 
-	ApplyAutomixEq(interleaved, audio_format, phase, eq_strength,
-		       eq_state, true);
+		const auto retrieved = eq_state.stretcher->retrieve(output_ptrs.data(),
+								   size_t(available));
+		if (retrieved > 0) {
+			const size_t retrieved_frames = size_t(retrieved);
+			const size_t start = std::min(eq_state.stretcher_start_delay,
+						      retrieved_frames);
+			eq_state.stretcher_start_delay -= start;
 
-	PcmBuffer out_temp;
-	auto raw = pcm_convert_from_float(out_temp, audio_format.format,
-					 interleaved);
-	if (raw.empty())
-		return nullptr;
+			if (start < retrieved_frames) {
+				std::vector<float> interleaved((retrieved_frames - start) * channels);
+				for (size_t frame = start; frame < retrieved_frames; ++frame)
+					for (unsigned ch = 0; ch < channels; ++ch)
+						interleaved[(frame - start) * channels + ch] =
+							output_channels[ch][frame];
+
+				ApplyAutomixEq(interleaved, dst_format, phase, eq_strength,
+					       eq_state, true);
+
+				PcmBuffer out_temp;
+				auto raw = pcm_convert_from_float(out_temp, dst_format.format,
+								 interleaved);
+				if (!raw.empty())
+					eq_state.AppendStretcherOutput(raw);
+			}
+		}
+	}
 
 	auto dest = buffer.Allocate();
 	if (!dest)
 		return nullptr;
 
-	auto writable = dest->Write(audio_format, SongTime::Cast(src.time), src.bit_rate);
-	const size_t nbytes = std::min(writable.size(), raw.size());
-	std::copy(raw.begin(), raw.begin() + nbytes, writable.begin());
-	dest->Expand(audio_format, nbytes);
+	auto writable = dest->Write(dst_format, SongTime::Cast(src.time), src.bit_rate);
+	const size_t nbytes = std::min(writable.size(), converted.size());
+	const size_t dry_bytes = std::min(nbytes, dry_raw.size());
+	if (dry_bytes > 0)
+		std::copy_n(dry_raw.begin(), dry_bytes, writable.begin());
+	if (dry_bytes < nbytes)
+		std::fill(writable.begin() + dry_bytes, writable.begin() + nbytes,
+			  std::byte{});
+
+	const size_t pending_bytes = eq_state.stretcher_pending.size() -
+				    eq_state.stretcher_pending_offset;
+	const size_t copy_bytes = std::min(nbytes, pending_bytes);
+	if (copy_bytes > 0) {
+		std::copy_n(eq_state.stretcher_pending.begin() +
+				 eq_state.stretcher_pending_offset,
+				 copy_bytes, writable.begin());
+		eq_state.stretcher_pending_offset += copy_bytes;
+		if (eq_state.stretcher_pending_offset == eq_state.stretcher_pending.size()) {
+			eq_state.stretcher_pending.clear();
+			eq_state.stretcher_pending_offset = 0;
+		} else if (eq_state.stretcher_pending_offset >= 65536) {
+			eq_state.stretcher_pending.erase(eq_state.stretcher_pending.begin(),
+						 eq_state.stretcher_pending.begin() +
+						 eq_state.stretcher_pending_offset);
+			eq_state.stretcher_pending_offset = 0;
+		}
+	}
+	dest->Expand(dst_format, nbytes);
 	dest->tag = src.tag ? std::make_unique<Tag>(*src.tag) : nullptr;
 	dest->replay_gain_info = src.replay_gain_info;
 	dest->replay_gain_serial = src.replay_gain_serial;
@@ -909,25 +1414,10 @@ Player::CheckDecoderStartup(std::unique_lock<Mutex> &lock) noexcept
 	} else if (!dc.IsStarting()) {
 		/* the decoder is ready and ok */
 
-		if (output_open &&
-		    !pc.WaitOutputConsumed(lock, 1))
-			/* the output devices haven't finished playing
-			   all chunks yet - wait for that */
-			return true;
+		decoder_starting = false;
 
 		pc.total_time = real_song_duration(*dc.song,
 						   dc.total_time);
-		pc.audio_format = dc.in_audio_format;
-		play_audio_format = dc.out_audio_format;
-		decoder_starting = false;
-
-		const size_t buffer_before_play_size =
-			play_audio_format.TimeToSize(buffer_before_play_duration);
-		buffer_before_play =
-			(buffer_before_play_size + sizeof(MusicChunk::data) - 1)
-			/ sizeof(MusicChunk::data);
-
-		pc.listener.OnPlayerStateChanged();
 
 		if (pending_seek > SongTime::zero()) {
 			assert(pc.seeking);
@@ -948,11 +1438,27 @@ Player::CheckDecoderStartup(std::unique_lock<Mutex> &lock) noexcept
 			buffering = true;
 		}
 
+		if (output_open)
+			/* keep the current output format until SongBorder()
+			   switches the pipe to the next song */
+			return true;
+
+		pc.audio_format = dc.in_audio_format;
+		play_audio_format = dc.out_audio_format;
+
+		const size_t buffer_before_play_size =
+			play_audio_format.TimeToSize(buffer_before_play_duration);
+		buffer_before_play =
+			(buffer_before_play_size + sizeof(MusicChunk::data) - 1)
+			/ sizeof(MusicChunk::data);
+
+		pc.listener.OnPlayerStateChanged();
+
 		if (!paused && !OpenOutput()) {
 			FmtError(player_domain,
-				 "problems opening audio device "
-				 "while playing {:?}",
-				 dc.song->GetURI());
+					 "problems opening audio device "
+					 "while playing {:?}",
+					 dc.song->GetURI());
 			return true;
 		}
 
@@ -1013,6 +1519,16 @@ Player::SeekDecoder(std::unique_lock<Mutex> &lock) noexcept
 
 	CancelPendingSeek();
 
+	/*
+	 * A user seek invalidates any planned or active cross-fade/automix
+	 * transition.  Automix may already have moved xfade_state to ENABLED
+	 * or ACTIVE before the seek command arrives; keeping that state across
+	 * the seek makes the old transition resume at the wrong song position
+	 * and also trips the historical UNKNOWN assertions below.
+	 */
+	ResetCrossFade();
+	cross_fade_tag.reset();
+
 	{
 		const ScopeUnlock unlock{lock};
 		pc.outputs.Cancel();
@@ -1037,7 +1553,8 @@ Player::SeekDecoder(std::unique_lock<Mutex> &lock) noexcept
 		pc.seeking = true;
 		pc.CommandFinished();
 
-		assert(xfade_state == CrossFadeState::UNKNOWN);
+		if (xfade_state != CrossFadeState::UNKNOWN)
+			ResetCrossFade();
 
 		return true;
 	} else {
@@ -1071,7 +1588,8 @@ Player::SeekDecoder(std::unique_lock<Mutex> &lock) noexcept
 
 	pc.CommandFinished();
 
-	assert(xfade_state == CrossFadeState::UNKNOWN);
+	if (xfade_state != CrossFadeState::UNKNOWN)
+		ResetCrossFade();
 
 	/* re-fill the buffer after seeking */
 	buffering = true;
@@ -1192,26 +1710,30 @@ Player::CheckCrossFade() noexcept
 		return;
 	}
 
-	if (!IsDecoderAtNextSong() || dc.IsStarting() || dc.pipe->IsEmpty())
-		/* we need information about the next song before we
-		   can decide */
-		/* the "pipe.empty" check is here so we wait for all
-		   (ReplayGain/MixRamp) metadata to appear, which some
-		   decoders parse only after reporting readiness */
-		return;
-
-	if (!MixRampScannerReady())
-		/* need more chunks for the MixRamp scanner */
-		return;
-
 	const auto chunk_duration =
 		play_audio_format.SizeToTime<FloatDuration>(sizeof(MusicChunk::data));
 
 	if (pc.GetAutomix()) {
-		if (song == nullptr || dc.song == nullptr)
+		if (song == nullptr || !queued || pc.next_song == nullptr)
 			return;
 
-		const auto plan = GetAutomixPlan(*song, *dc.song);
+		/*
+		 * Automix must decide before the next decoder has necessarily
+		 * started.  The normal crossfade path waits for dc.pipe to contain
+		 * decoded audio from the next song, but automix uses tag/beat data and
+		 * can choose the transition point from pc.next_song alone.  Waiting for
+		 * IsDecoderAtNextSong() here creates a dead zone for songs with long
+		 * fade-outs: the next decoder is not started until the current song is
+		 * over, so no transition can happen.
+		 */
+		FmtDebug(player_domain,
+			 "automix check-crossfade current={:?} next={:?} play_format={} next_out_format={} pipe_size={} next_pipe_size={} buffer_before_play={} decoder_next={}",
+			 song->GetURI(), pc.next_song->GetURI(), play_audio_format,
+			 dc.out_audio_format, pipe->GetSize(),
+			 IsDecoderAtNextSong() && dc.pipe != nullptr ? dc.pipe->GetSize() : 0,
+			 buffer_before_play, IsDecoderAtNextSong());
+
+		const auto plan = GetAutomixPlan(*song, *pc.next_song);
 		if (plan) {
 			automix_time_ratio = plan->time_ratio;
 			automix_eq_strength = plan->eq_strength;
@@ -1222,6 +1744,10 @@ Player::CheckCrossFade() noexcept
 
 			const auto cross_fade_duration =
 				std::max(SongTime::zero(), SongTime::Cast(song_duration) - plan->transition_start);
+			FmtDebug(player_domain,
+				 "automix duration current_duration={} transition_start={} cross_fade_duration={} chunk_duration={}",
+				 song_duration.ToDoubleS(), plan->transition_start.ToDoubleS(),
+				 cross_fade_duration.ToDoubleS(), chunk_duration.count());
 			cross_fade_chunks =
 				std::lround(cross_fade_duration.ToDoubleS() /
 					    chunk_duration.count());
@@ -1231,13 +1757,13 @@ Player::CheckCrossFade() noexcept
 			if (plan->time_ratio)
 				FmtDebug(player_domain,
 					 "automix ratio accepted current={:?} next={:?} ratio={} eq_strength={}",
-					 song->GetURI(), dc.song->GetURI(), *plan->time_ratio,
+					 song->GetURI(), pc.next_song->GetURI(), *plan->time_ratio,
 					 plan->eq_strength);
 			else
 				FmtDebug(player_domain,
 					 "automix ratio rejected current={:?} next={:?} eq_strength={}",
-					 song->GetURI(), dc.song->GetURI(), plan->eq_strength);
-			LogAutomixPlan(*song, *dc.song, *plan, cross_fade_chunks);
+					 song->GetURI(), pc.next_song->GetURI(), plan->eq_strength);
+			LogAutomixPlan(*song, *pc.next_song, *plan, cross_fade_chunks);
 			if (cross_fade_chunks > 0)
 				xfade_state = CrossFadeState::ENABLED;
 			else {
@@ -1249,9 +1775,21 @@ Player::CheckCrossFade() noexcept
 
 		FmtDebug(player_domain,
 			 "automix plan unavailable current={:?} next={:?}",
-			 song->GetURI(), dc.song->GetURI());
+			 song->GetURI(), pc.next_song->GetURI());
 		ResetAutomixTransition();
 	}
+
+	if (!IsDecoderAtNextSong() || dc.IsStarting() || dc.pipe->IsEmpty())
+		/* we need information about the next song before we
+		   can decide */
+		/* the "pipe.empty" check is here so we wait for all
+		   (ReplayGain/MixRamp) metadata to appear, which some
+		   decoders parse only after reporting readiness */
+		return;
+
+	if (!MixRampScannerReady())
+		/* need more chunks for the MixRamp scanner */
+		return;
 
 	if (!pc.cross_fade.CanCrossFade(pc.total_time, dc.total_time,
 						 dc.out_audio_format,
@@ -1352,17 +1890,35 @@ Player::PlayNextChunk() noexcept
 
 		unsigned cross_fade_position = pipe->GetSize();
 		assert(cross_fade_position <= cross_fade_chunks);
+		FmtDebug(player_domain,
+			 "automix xfade active position={} chunks={} pipe_size={} next_pipe_size={} play_format={} next_out_format={} time_ratio={} eq_strength={}",
+			 cross_fade_position, cross_fade_chunks, pipe->GetSize(), dc.pipe->GetSize(),
+			 play_audio_format, dc.out_audio_format,
+			 automix_time_ratio ? *automix_time_ratio : 1.0f,
+			 automix_eq_strength ? *automix_eq_strength : 0.0f);
 
-		auto other_chunk = dc.pipe->Shift();
-		if (other_chunk != nullptr) {
+		const auto *current_peek = pipe->Peek();
+		const bool automix_pending_ready = pc.GetAutomix() && automix_eq_strength &&
+			current_peek != nullptr && current_peek->length > 0 &&
+			automix_eq_incoming.automix_pending.size() >= current_peek->length;
+		if (automix_pending_ready)
+			FmtDebug(player_domain,
+				 "automix using pending-only incoming pending_bytes={} current_bytes={} next_pipe_size={}",
+				 automix_eq_incoming.automix_pending.size(), current_peek->length, dc.pipe->GetSize());
+
+		auto other_chunk = automix_pending_ready ? nullptr : dc.pipe->Shift();
+		if (other_chunk != nullptr || automix_pending_ready) {
+			LogAutomixChunk("xfade-other-shifted", other_chunk.get(), dc.out_audio_format);
 			chunk = pipe->Shift();
 			assert(chunk != nullptr);
 			assert(chunk->other == nullptr);
+			LogAutomixChunk("xfade-current-shifted", chunk.get(), play_audio_format);
 
 			/* don't send the tags of the new song (which
 			   is being faded in) yet; postpone it until
 			   the current song is faded out */
-			cross_fade_tag = Tag::Merge(std::move(cross_fade_tag),
+			if (other_chunk != nullptr)
+				cross_fade_tag = Tag::Merge(std::move(cross_fade_tag),
 						    std::move(other_chunk->tag));
 
 			if (pc.cross_fade.mixramp_delay <= FloatDuration::zero()) {
@@ -1372,23 +1928,21 @@ Player::PlayNextChunk() noexcept
 				chunk->mix_ratio = -1;
 			}
 
+			const float automix_phase = 1.0f - static_cast<float>(cross_fade_position)
+								    / static_cast<float>(cross_fade_chunks);
+			const float automix_next_phase = 1.0f - static_cast<float>(cross_fade_position > 0
+										 ? cross_fade_position - 1
+										 : 0)
+								    / static_cast<float>(cross_fade_chunks);
+
 			if (pc.GetAutomix() && automix_time_ratio) {
 				chunk->automix = true;
 				chunk->automix_time_ratio = *automix_time_ratio;
+				FmtDebug(player_domain, "automix mark-current ratio={}", *automix_time_ratio);
 			}
 
-			const float automix_phase = 1.0f - static_cast<float>(cross_fade_position)
-								    / static_cast<float>(cross_fade_chunks);
-
-			if (pc.GetAutomix() && automix_time_ratio && automix_eq_strength) {
-				auto transformed = AutomixEqChunk(buffer, *chunk, play_audio_format,
-								 automix_phase, *automix_eq_strength,
-								 automix_eq_outgoing, false);
-				if (transformed != nullptr)
-					chunk = std::move(transformed);
-			}
-
-			if (other_chunk->IsEmpty()) {
+			if (other_chunk && other_chunk->IsEmpty()) {
+				FmtDebug(player_domain, "automix drop empty incoming tag-only chunk");
 				/* the "other" chunk was a MusicChunk
 				   which had only a tag, but no music
 				   data - we cannot cross-fade that;
@@ -1399,30 +1953,103 @@ Player::PlayNextChunk() noexcept
 				other_chunk.reset();
 			}
 
-			if (other_chunk && pc.GetAutomix() && automix_time_ratio &&
-			    automix_eq_strength) {
+			if ((other_chunk || automix_pending_ready) && pc.GetAutomix() && automix_eq_strength) {
+				FmtDebug(player_domain, "automix try player-side mix");
+				/*
+				 * Automix owns the transition completely: convert both sides to
+				 * one format, EQ them, apply one sample-accurate fade clock and
+				 * emit a plain chunk.  Do not attach chunk->other; the generic
+				 * output cross-fader cannot see automix's format/EQ/timing state
+				 * and small mismatches there were the source of audible glitches.
+				 */
+				auto mixed = AutomixMixChunk(buffer, *chunk, other_chunk.get(),
+							       play_audio_format, dc.out_audio_format,
+							       play_audio_format, *dc.pipe,
+							       automix_phase, automix_next_phase,
+							       *automix_eq_strength,
+							       automix_eq_outgoing,
+							       automix_eq_incoming);
+				if (mixed != nullptr) {
+					FmtDebug(player_domain, "automix player-side mix succeeded");
+					chunk = std::move(mixed);
+					other_chunk.reset();
+				} else
+					FmtDebug(player_domain, "automix player-side mix failed; falling back to transformed other");
+			}
+
+			if (other_chunk && pc.GetAutomix() && automix_eq_strength) {
+				FmtDebug(player_domain, "automix try transform incoming");
 				MusicChunkPtr transformed;
 #ifdef ENABLE_RUBBERBAND
-				transformed = AutomixChunk(buffer, *other_chunk,
+				if (automix_time_ratio) {
+					const float ramped_time_ratio =
+						1.0f + (*automix_time_ratio - 1.0f) * automix_phase;
+					transformed = AutomixChunk(buffer, *other_chunk,
+							   dc.out_audio_format,
 							   play_audio_format,
-							   *automix_time_ratio,
+							   ramped_time_ratio,
 							   *automix_eq_strength,
 							   automix_phase,
 							   automix_eq_incoming);
+					if (transformed == nullptr)
+						transformed = AutomixEqChunk(buffer, *other_chunk,
+								dc.out_audio_format,
+								play_audio_format,
+								automix_phase,
+								*automix_eq_strength,
+								automix_eq_incoming,
+								true);
+				} else
+					transformed = AutomixEqChunk(buffer, *other_chunk,
+							     dc.out_audio_format,
+							     play_audio_format,
+							     automix_phase,
+							     *automix_eq_strength,
+							     automix_eq_incoming,
+							     true);
 #else
 				transformed = AutomixEqChunk(buffer, *other_chunk,
+							     dc.out_audio_format,
 							     play_audio_format,
 							     automix_phase,
 							     *automix_eq_strength,
 							     automix_eq_incoming,
 							     true);
 #endif
-				if (transformed != nullptr)
+				if (transformed != nullptr) {
+					FmtDebug(player_domain, "automix transform incoming succeeded");
 					other_chunk = std::move(transformed);
+				} else if (automix_time_ratio) {
+					FmtDebug(player_domain, "automix transform incoming failed; dropping because ratio path required conversion");
+					/*
+					 * Automix may cross-fade tracks whose decoder/output
+					 * formats differ.  In that case the incoming chunk must
+					 * be converted to play_audio_format before it is attached
+					 * as chunk->other; otherwise AudioOutputSource will try to
+					 * mix two different formats and hit its format assertion.
+					 * If both RubberBand and the EQ-only fallback failed, skip
+					 * this incoming chunk instead of passing raw decoder PCM.
+					 */
+					other_chunk.reset();
+				}
 			}
 
+#ifndef NDEBUG
+			if (other_chunk != nullptr &&
+			    !other_chunk->CheckFormat(play_audio_format)) {
+				FmtDebug(player_domain,
+					 "automix dropping incoming chunk with mismatched format");
+				other_chunk.reset();
+			}
+#endif
+
+			LogAutomixChunk("xfade-current-before-output", chunk.get(), play_audio_format);
+			LogAutomixChunk("xfade-other-before-output", other_chunk.get(), play_audio_format);
 			chunk->other = std::move(other_chunk);
 		} else {
+			FmtDebug(player_domain,
+				 "automix xfade no incoming chunk position={} current_pipe_size={} next_pipe_size={}",
+				 cross_fade_position, pipe->GetSize(), dc.pipe->GetSize());
 			/* there are not enough decoded chunks yet */
 
 			std::unique_lock lock{pc.mutex};
@@ -1505,6 +2132,14 @@ Player::SongBorder() noexcept
 
 	ActivateDecoder();
 
+	pc.audio_format = dc.in_audio_format;
+	play_audio_format = dc.out_audio_format;
+	const size_t buffer_before_play_size =
+		play_audio_format.TimeToSize(buffer_before_play_duration);
+	buffer_before_play =
+		(buffer_before_play_size + sizeof(MusicChunk::data) - 1)
+		/ sizeof(MusicChunk::data);
+
 	const bool border_pause = pc.ApplyBorderPause();
 	if (border_pause) {
 		const ScopeUnlock unlock(pc.mutex);
@@ -1520,6 +2155,10 @@ Player::SongBorder() noexcept
 
 		pc.outputs.Pause();
 		pc.listener.OnPlayerStateChanged();
+	} else if (!paused && !OpenOutput()) {
+		FmtError(player_domain,
+			 "problems opening audio device while playing {:?}",
+			 song->GetURI());
 	}
 }
 
@@ -1575,8 +2214,18 @@ Player::Run() noexcept
 		}
 
 		if (pc.GetAutomix() && queued && IsDecoderAtCurrentSong() &&
+		    dc.IsIdle() && dc.pipe == pipe &&
 		    xfade_state == CrossFadeState::ENABLED &&
 		    pipe->GetSize() <= cross_fade_chunks + buffer_before_play) {
+			/*
+			 * Only re-arm the decoder after the current decoder has fully
+			 * finished and its current-song pipe is no longer being written.
+			 * Starting the next decoder while the current decoder is still
+			 * initializing/decoding can swap dc.pipe underneath DecoderControl;
+			 * the decoder thread may then call SetReady() with buffered chunks in
+			 * the replacement pipe, tripping DecoderControl::SetReady()'s
+			 * pipe->IsEmpty() assertion.
+			 */
 			FmtDebug(player_domain,
 				 "automix start next decoder pipe_size={} threshold={}",
 				 pipe->GetSize(), cross_fade_chunks + buffer_before_play);
